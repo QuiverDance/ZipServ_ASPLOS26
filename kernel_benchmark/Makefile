@@ -49,7 +49,7 @@ ALL_CCFLAGS += --use_fast_math
 ALL_CCFLAGS += --ptxas-options=-v,-warn-lmem-usage,--warn-on-spills
 ################################################################################
 # Target rules
-all: test_mm  test_decompress
+all: test_mm test_decompress bench_llama31_70b_compress bench_zipserv_gemm_sweep
 
 test_mm.o:  test_mm.cu utils.h 
 	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
@@ -63,5 +63,21 @@ test_decompress.o:  test_decompress.cu utils.h
 test_decompress: test_decompress.o 
 	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
 
+bench_llama31_70b_compress.o: bench_llama31_70b_compress.cu utils.h
+	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
+bench_llama31_70b_compress: bench_llama31_70b_compress.o
+	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+
+bench_zipserv_gemm_sweep.o: bench_zipserv_gemm_sweep.cu utils.h
+	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
+bench_zipserv_gemm_sweep: bench_zipserv_gemm_sweep.o
+	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+
 clean:
-	rm -f test_mm test_mm.o test_decompress test_decompress.o
+	rm -f test_mm test_mm.o \
+		test_decompress test_decompress.o \
+		bench_llama31_70b_compress bench_llama31_70b_compress.o \
+		bench_llama31_70b_codec bench_llama31_70b_codec.o \
+		bench_zipserv_gemm_sweep bench_zipserv_gemm_sweep.o

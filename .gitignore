@@ -1,0 +1,20 @@
+# Build artifacts
+*.o
+*.so
+*.a
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Benchmark binaries
+/kernel_benchmark/bench_llama31_70b_compress
+/kernel_benchmark/bench_zipserv_gemm_sweep
+/kernel_benchmark/test_mm
+/kernel_benchmark/test_decompress
+
+# Benchmark outputs
+/kernel_benchmark/*.csv
+
+# Optional local assets
+/paper/*.pdf
