@@ -20,6 +20,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "L_API.cuh"
@@ -38,7 +39,6 @@ struct ProgramOptions {
     std::string out_csv = "results_zipserv_gemm.csv";
     int device = 0;
     int seed = 1234;
-    bool emit_aggregate = true;
     bool weight_offload = false;
 };
 
@@ -90,7 +90,7 @@ struct DeviceCompressedBuffers {
 };
 
 struct GemmCsvRow {
-    std::string kind; // tensor/aggregate
+    std::string kind; // tensor
     std::string group;
     std::string name; // short tensor name used in terminal table
     int layer = 0;
@@ -152,7 +152,6 @@ void PrintUsage() {
         << "  --out <path>          Output CSV path (default: results_zipserv_gemm.csv)\n"
         << "  --device <int>        CUDA device index (default: 0)\n"
         << "  --seed <int>          Random seed (default: 1234)\n"
-        << "  --emit_aggregate <0|1> Emit qkv_sum and gateup_sum rows (default: 1)\n"
         << "  --weight_offload <0|1> Include weight H2D transfer in timing (default: 0)\n"
         << "  --help                Show this help\n";
 }
@@ -186,8 +185,6 @@ bool ParseOptions(int argc, char** argv, ProgramOptions* opts) {
             opts->device = std::atoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             opts->seed = std::atoi(argv[++i]);
-        } else if (arg == "--emit_aggregate" && i + 1 < argc) {
-            opts->emit_aggregate = (std::atoi(argv[++i]) != 0);
         } else if (arg == "--weight_offload" && i + 1 < argc) {
             opts->weight_offload = (std::atoi(argv[++i]) != 0);
         } else {
@@ -256,6 +253,97 @@ bool ConvertRawToBF16(const ManifestTensor& tensor, std::vector<__nv_bfloat16>* 
 
     out->resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
     std::memcpy(out->data(), raw.data(), expected);
+    return true;
+}
+
+bool BuildWeightSpec(
+    const std::map<std::string, ManifestTensor>& by_suffix,
+    const std::string& group,
+    const std::string& short_name,
+    WeightSpec* out,
+    std::string* error) {
+    std::map<std::string, ManifestTensor>::const_iterator it = by_suffix.find(short_name);
+    if (it == by_suffix.end()) {
+        *error = "Missing tensor in manifest for weight: " + short_name;
+        return false;
+    }
+
+    WeightSpec w;
+    w.group = group;
+    w.short_name = short_name;
+    w.tensor = it->second;
+    if (w.tensor.shape.size() != 2) {
+        *error = "Tensor shape is not 2D: " + w.tensor.name;
+        return false;
+    }
+    w.rows = w.tensor.shape[0];
+    w.cols = w.tensor.shape[1];
+    if (w.rows <= 0 || w.cols <= 0) {
+        *error = "Invalid tensor shape for weight: " + w.tensor.name;
+        return false;
+    }
+    if (!ConvertRawToBF16(w.tensor, &w.host_weight, error)) {
+        return false;
+    }
+
+    *out = std::move(w);
+    return true;
+}
+
+bool BuildRowConcatenatedWeight(
+    const std::vector<const WeightSpec*>& src,
+    WeightSpec* dst,
+    std::string* error) {
+    if (src.empty()) {
+        *error = "fused source list is empty";
+        return false;
+    }
+    if (src[0] == nullptr) {
+        *error = "fused source contains null weight";
+        return false;
+    }
+
+    const int expected_cols = src[0]->cols;
+    size_t total_rows = 0;
+    size_t total_elems = 0;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const WeightSpec* w = src[i];
+        if (w == nullptr) {
+            *error = "fused source contains null weight";
+            return false;
+        }
+        if (w->cols != expected_cols) {
+            std::ostringstream oss;
+            oss << "fused source K mismatch: " << w->short_name
+                << " has K=" << w->cols << ", expected " << expected_cols;
+            *error = oss.str();
+            return false;
+        }
+        const size_t expected_elems = static_cast<size_t>(w->rows) * static_cast<size_t>(w->cols);
+        if (w->host_weight.size() != expected_elems) {
+            std::ostringstream oss;
+            oss << "host weight size mismatch for " << w->short_name
+                << ": expected " << expected_elems << ", got " << w->host_weight.size();
+            *error = oss.str();
+            return false;
+        }
+        total_rows += static_cast<size_t>(w->rows);
+        total_elems += w->host_weight.size();
+    }
+
+    if (total_rows > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        *error = "fused total rows overflow int";
+        return false;
+    }
+
+    dst->rows = static_cast<int>(total_rows);
+    dst->cols = expected_cols;
+    dst->host_weight.clear();
+    dst->host_weight.reserve(total_elems);
+    for (size_t i = 0; i < src.size(); ++i) {
+        const WeightSpec* w = src[i];
+        dst->host_weight.insert(dst->host_weight.end(), w->host_weight.begin(), w->host_weight.end());
+    }
     return true;
 }
 
@@ -883,28 +971,109 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < request_order.size(); ++i) {
         const std::string& group = request_order[i].first;
         const std::string& short_name = request_order[i].second;
-        if (by_suffix.find(short_name) == by_suffix.end()) {
-            std::cerr << "Missing tensor in manifest (layer " << opts.layer << "): " << short_name << "\n";
-            return 1;
-        }
         WeightSpec w;
-        w.group = group;
-        w.short_name = short_name;
-        w.tensor = by_suffix[short_name];
-        if (w.tensor.shape.size() != 2) {
-            std::cerr << "Tensor shape is not 2D: " << w.tensor.name << "\n";
-            return 1;
-        }
-        w.rows = w.tensor.shape[0];
-        w.cols = w.tensor.shape[1];
-
         std::string load_error;
-        if (!ConvertRawToBF16(w.tensor, &w.host_weight, &load_error)) {
+        if (!BuildWeightSpec(by_suffix, group, short_name, &w, &load_error)) {
             std::cerr << load_error << "\n";
             return 1;
         }
         weights.push_back(w);
     }
+
+    const char* const kFusedRequired[] = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"};
+    for (size_t i = 0; i < sizeof(kFusedRequired) / sizeof(kFusedRequired[0]); ++i) {
+        const std::string name = kFusedRequired[i];
+        if (by_suffix.find(name) == by_suffix.end()) {
+            std::cerr << "Missing tensor for fused benchmark in manifest (layer "
+                      << opts.layer << "): " << name << "\n";
+            return 1;
+        }
+    }
+
+    std::map<std::string, WeightSpec> fused_component_pool;
+    auto ResolveFusedComponent = [&](const std::string& short_name, const WeightSpec** out_ptr, std::string* error) -> bool {
+        for (size_t i = 0; i < weights.size(); ++i) {
+            if (weights[i].short_name == short_name) {
+                *out_ptr = &weights[i];
+                return true;
+            }
+        }
+
+        std::map<std::string, WeightSpec>::iterator it = fused_component_pool.find(short_name);
+        if (it != fused_component_pool.end()) {
+            *out_ptr = &it->second;
+            return true;
+        }
+
+        WeightSpec loaded;
+        if (!BuildWeightSpec(by_suffix, "fused_component", short_name, &loaded, error)) {
+            return false;
+        }
+        std::pair<std::map<std::string, WeightSpec>::iterator, bool> inserted =
+            fused_component_pool.insert(std::make_pair(short_name, std::move(loaded)));
+        *out_ptr = &inserted.first->second;
+        return true;
+    };
+
+    const WeightSpec* q_proj = nullptr;
+    const WeightSpec* k_proj = nullptr;
+    const WeightSpec* v_proj = nullptr;
+    const WeightSpec* gate_proj = nullptr;
+    const WeightSpec* up_proj = nullptr;
+    std::string fused_error;
+    if (!ResolveFusedComponent("q_proj", &q_proj, &fused_error) ||
+        !ResolveFusedComponent("k_proj", &k_proj, &fused_error) ||
+        !ResolveFusedComponent("v_proj", &v_proj, &fused_error) ||
+        !ResolveFusedComponent("gate_proj", &gate_proj, &fused_error) ||
+        !ResolveFusedComponent("up_proj", &up_proj, &fused_error)) {
+        std::cerr << "Failed to resolve fused component: " << fused_error << "\n";
+        return 1;
+    }
+
+    WeightSpec qkv_fused;
+    qkv_fused.group = "qkv";
+    qkv_fused.short_name = "qkv_fused";
+    qkv_fused.tensor.layer = opts.layer;
+    qkv_fused.tensor.name = "fused.qkv";
+    qkv_fused.tensor.dtype = "bf16";
+    {
+        std::vector<const WeightSpec*> src;
+        src.push_back(q_proj);
+        src.push_back(k_proj);
+        src.push_back(v_proj);
+        if (!BuildRowConcatenatedWeight(src, &qkv_fused, &fused_error)) {
+            std::cerr << "Failed to build qkv_fused weight: " << fused_error << "\n";
+            return 1;
+        }
+    }
+    qkv_fused.tensor.shape.push_back(qkv_fused.rows);
+    qkv_fused.tensor.shape.push_back(qkv_fused.cols);
+    qkv_fused.tensor.nbytes =
+        static_cast<size_t>(qkv_fused.rows) * static_cast<size_t>(qkv_fused.cols) * sizeof(__nv_bfloat16);
+
+    WeightSpec gateup_fused;
+    gateup_fused.group = "gateup";
+    gateup_fused.short_name = "gateup_fused";
+    gateup_fused.tensor.layer = opts.layer;
+    gateup_fused.tensor.name = "fused.gateup";
+    gateup_fused.tensor.dtype = "bf16";
+    {
+        std::vector<const WeightSpec*> src;
+        src.push_back(gate_proj);
+        src.push_back(up_proj);
+        if (!BuildRowConcatenatedWeight(src, &gateup_fused, &fused_error)) {
+            std::cerr << "Failed to build gateup_fused weight: " << fused_error << "\n";
+            return 1;
+        }
+    }
+    gateup_fused.tensor.shape.push_back(gateup_fused.rows);
+    gateup_fused.tensor.shape.push_back(gateup_fused.cols);
+    gateup_fused.tensor.nbytes =
+        static_cast<size_t>(gateup_fused.rows) * static_cast<size_t>(gateup_fused.cols) * sizeof(__nv_bfloat16);
+
+    weights.push_back(std::move(qkv_fused));
+    weights.push_back(std::move(gateup_fused));
+    fused_component_pool.clear();
 
     std::ofstream ofs(opts.out_csv.c_str(), std::ios::out | std::ios::trunc);
     if (!ofs.is_open()) {
@@ -1111,81 +1280,6 @@ int main(int argc, char** argv) {
         cudaFree(d_weight);
         FreeDeviceCompressedBuffers(&comp_dev);
         FreeCompressedBuffers(&comp_host);
-    }
-
-    if (opts.emit_aggregate) {
-        struct Agg {
-            size_t orig_bytes = 0;
-            size_t comp_bytes = 0;
-            double baseline_ms = 0.0;
-            double zipserv_ms = 0.0;
-        };
-        std::map<std::string, Agg> aggs;
-
-        for (size_t i = 0; i < all_rows.size(); ++i) {
-            const GemmCsvRow& r = all_rows[i];
-            if (r.kind != "tensor") {
-                continue;
-            }
-            if (!(r.group == "qkv" || r.group == "gateup")) {
-                continue;
-            }
-            std::string key = r.group + "|" + std::to_string(r.tokens);
-            Agg& a = aggs[key];
-            a.orig_bytes += r.orig_bytes;
-            a.comp_bytes += r.comp_bytes;
-            a.baseline_ms += r.baseline_ms;
-            a.zipserv_ms += r.zipserv_ms;
-        }
-
-        for (std::map<std::string, Agg>::const_iterator it = aggs.begin(); it != aggs.end(); ++it) {
-            std::string key = it->first;
-            const Agg& a = it->second;
-            std::vector<std::string> parts;
-            std::stringstream ss(key);
-            std::string part;
-            while (std::getline(ss, part, '|')) {
-                parts.push_back(part);
-            }
-            if (parts.size() != 2) {
-                continue;
-            }
-
-            GemmCsvRow row;
-            row.kind = "aggregate";
-            row.group = parts[0] + "_sum";
-            row.name = row.group;
-            row.layer = opts.layer;
-            row.tokens = std::atoi(parts[1].c_str());
-            row.M = row.tokens;
-            row.N = 0;
-            row.K = 0;
-            row.weight_name = row.group;
-            row.weight_shape = "mixed";
-            row.dtype = "bf16";
-            row.orig_bytes = a.orig_bytes;
-            row.comp_bytes = a.comp_bytes;
-            row.baseline_ms = a.baseline_ms;
-            row.zipserv_ms = a.zipserv_ms;
-            row.zip_over_base = (a.baseline_ms > 0.0) ? (a.zipserv_ms / a.baseline_ms) : 0.0;
-            row.baseline_gbps = GBpsFromBytesAndMs(a.orig_bytes, a.baseline_ms);
-            row.zipserv_gbps = GBpsFromBytesAndMs(a.orig_bytes, a.zipserv_ms);
-            row.x_shape = "mixed";
-            row.w_shape = "mixed";
-            row.y_shape = "mixed";
-            row.baseline_cfg = baseline_cfg;
-            row.zipserv_cfg = zipserv_cfg;
-            all_rows.push_back(row);
-            PrintResultTableRow(
-                row.group,
-                row.name,
-                row.tokens,
-                row.M,
-                row.N,
-                row.K,
-                row.baseline_ms,
-                row.zipserv_ms);
-        }
     }
 
     for (size_t i = 0; i < all_rows.size(); ++i) {

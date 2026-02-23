@@ -4,6 +4,10 @@
 - `bench_zipserv_gemm_sweep`: layer 0 대상 Uncompressed GEMM vs ZipServ GEMM (tokens sweep)
 - `bench_llama31_70b_compress`: layer별(0..79) tensor 단위 compress/decompress latency + 압축률
 
+`bench_zipserv_gemm_sweep`의 현재 동작:
+- `--ops`는 개별 tensor(`q/k/v/o/gate/up/down`) 선택에만 적용
+- fused GEMM 2종(`qkv_fused`, `gateup_fused`)은 항상 추가 측정
+
 ## 1) 모델 다운로드
 
 ```bash
