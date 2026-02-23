@@ -92,7 +92,7 @@ cd ~/ZipServ_ASPLOS26/kernel_benchmark
 ## 6) 결과 컬럼
 
 ### GEMM CSV (`bench_zipserv_gemm_sweep`)
-- `kind,group,name,tok,M,N,K,base_ms,zip_ms,zip/base`
+- `name,M(tok),N,K,base_ms,zip_ms,zip/base`
 
 ### Compress CSV (`bench_llama31_70b_compress`)
 - `Layer,Tensor,Shape,DType,Orignal_Size,Compressed_Size,Ratio,Comp(ms),H2D(ms),Decomp(ms),H2D+Decomp(ms),CompBW,DecompBW`

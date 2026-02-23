@@ -7,7 +7,7 @@
 - zipserv: `BF16TripleBitmap_MM_API` (압축 weight)
 
 출력 CSV 컬럼:
-- `kind,group,name,tok,M,N,K,base_ms,zip_ms,zip/base`
+- `name,M(tok),N,K,base_ms,zip_ms,zip/base`
 
 ## 2) 측정 대상
 ### 2.1 `--ops`로 선택되는 개별 tensor

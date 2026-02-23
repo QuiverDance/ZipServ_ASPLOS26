@@ -33,7 +33,7 @@ struct ProgramOptions {
     std::string manifest_path;
     int layer = 0;
     std::string ops_spec = "qkv,o,gateup,down";
-    std::string tokens_spec = "1,2,4,8,16,32,48,64,80,96,112,128,144,160,176,192,208,224,240,256,512,1024";
+    std::string tokens_spec = "1,2,4,8,16,32,48,64,80,96,112,128,144,160,176,192,208,224,240,256,512,1024,2048,4096,8192";
     int warmup = 10;
     int iters = 100;
     std::string out_csv = "results_zipserv_gemm.csv";
@@ -90,11 +90,8 @@ struct DeviceCompressedBuffers {
 };
 
 struct GemmCsvRow {
-    std::string kind; // tensor
-    std::string group;
     std::string name; // short tensor name used in terminal table
     int layer = 0;
-    int tokens = 0;
     int M = 0;
     int N = 0;
     int K = 0;
@@ -799,24 +796,20 @@ std::string CublasMathModeToString(cublasMath_t mode) {
 void PrintResultTableHeader() {
     std::cout << "\n===== Per-Tensor Results =====\n";
     std::cout << std::left
-              << std::setw(10) << "group"
               << std::setw(12) << "name"
               << std::right
-              << std::setw(8) << "tok"
-              << std::setw(8) << "M"
+              << std::setw(8) << "M(tok)"
               << std::setw(8) << "N"
               << std::setw(8) << "K"
               << std::setw(14) << "base_ms"
               << std::setw(14) << "zip_ms"
               << std::setw(12) << "zip/base"
               << "\n";
-    std::cout << std::string(94, '-') << "\n";
+    std::cout << std::string(76, '-') << "\n";
 }
 
 void PrintResultTableRow(
-    const std::string& group,
     const std::string& name,
-    int tokens,
     int M,
     int N,
     int K,
@@ -825,10 +818,8 @@ void PrintResultTableRow(
     double ratio = (baseline_ms > 0.0) ? (zipserv_ms / baseline_ms) : 0.0;
 
     std::cout << std::left
-              << std::setw(10) << group
               << std::setw(12) << name
               << std::right
-              << std::setw(8) << tokens
               << std::setw(8) << M
               << std::setw(8) << N
               << std::setw(8) << K
@@ -839,7 +830,7 @@ void PrintResultTableRow(
 }
 
 void WriteCsvHeader(std::ofstream* ofs) {
-    (*ofs) << "kind,group,name,tok,M,N,K,base_ms,zip_ms,zip/base\n";
+    (*ofs) << "name,M(tok),N,K,base_ms,zip_ms,zip/base\n";
 }
 
 void WriteCsvRow(std::ofstream* ofs, const GemmCsvRow& row) {
@@ -848,10 +839,7 @@ void WriteCsvRow(std::ofstream* ofs, const GemmCsvRow& row) {
     zip_ms << std::fixed << std::setprecision(6) << row.zipserv_ms;
     zip_over_base << std::fixed << std::setprecision(3) << row.zip_over_base;
 
-    (*ofs) << bench_common::EscapeCSV(row.kind) << ","
-           << bench_common::EscapeCSV(row.group) << ","
-           << bench_common::EscapeCSV(row.name) << ","
-           << row.tokens << ","
+    (*ofs) << bench_common::EscapeCSV(row.name) << ","
            << row.M << ","
            << row.N << ","
            << row.K << ","
@@ -1236,11 +1224,8 @@ int main(int argc, char** argv) {
             }
 
             GemmCsvRow row;
-            row.kind = "tensor";
-            row.group = w.group;
             row.name = w.short_name;
             row.layer = opts.layer;
-            row.tokens = tok;
             row.M = logical_M;
             row.N = logical_N;
             row.K = logical_K;
@@ -1263,9 +1248,7 @@ int main(int argc, char** argv) {
             all_rows.push_back(row);
 
             PrintResultTableRow(
-                w.group,
                 w.short_name,
-                tok,
                 logical_M,
                 logical_N,
                 logical_K,
