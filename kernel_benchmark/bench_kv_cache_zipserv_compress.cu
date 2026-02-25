@@ -23,6 +23,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include <omp.h>
 
 #include "L_API.cuh"
 #include "bench_manifest_utils.h"
@@ -799,12 +800,18 @@ bool ConvertHeadSplitPadFp16ToBf16(const NpyInfo& info,
     const uint16_t* fp16_bits = reinterpret_cast<const uint16_t*>(raw.data() + info.data_offset);
     const size_t seq_row_base = static_cast<size_t>(seq_begin) * static_cast<size_t>(h);
 
+    const int local_mapped_rows = *mapped_rows;
+    const int local_mapped_cols = *mapped_cols;
+    const int local_padded_cols = *padded_cols;
+    __nv_bfloat16* out_data = out->data();
+
     const std::chrono::high_resolution_clock::time_point begin = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < *mapped_rows; ++r) {
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < local_mapped_rows; ++r) {
         const size_t global_row = seq_row_base + static_cast<size_t>(r);
-        const uint16_t* src_row = fp16_bits + global_row * static_cast<size_t>(*mapped_cols);
-        __nv_bfloat16* dst_row = out->data() + static_cast<size_t>(r) * static_cast<size_t>(*padded_cols);
-        for (int c = 0; c < *mapped_cols; ++c) {
+        const uint16_t* src_row = fp16_bits + global_row * static_cast<size_t>(local_mapped_cols);
+        __nv_bfloat16* dst_row = out_data + static_cast<size_t>(r) * static_cast<size_t>(local_padded_cols);
+        for (int c = 0; c < local_mapped_cols; ++c) {
             __half_raw hr;
             hr.x = src_row[c];
             const __half hval = hr;
@@ -1698,6 +1705,12 @@ void PrintSummary(const AggregateSummary& agg) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _OPENMP
+    std::cout << "OpenMP enabled: max_threads=" << omp_get_max_threads() << "\n";
+#else
+    std::cout << "OpenMP disabled: single-threaded mode\n";
+#endif
+
     ProgramOptions opts;
     if (!ParseOptions(argc, argv, &opts)) {
         if (argc >= 2 && std::string(argv[1]) == "--help") {
