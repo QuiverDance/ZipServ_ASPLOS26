@@ -187,55 +187,61 @@ double ComputeTotalError_BF16(const __nv_bfloat16* A, const __nv_bfloat16* B, in
 
 // Analyze exponent distribution of BF16 matrix
 void analyzeExponentDistribution_BF16(__nv_bfloat16* matrix, int M, int K, int* top_exponents, int top_n = 7) {
-    // Count exponent distribution
-    std::map<int, int> exponent_map;
-    
+    // Count exponent distribution using fixed-size array (O(1) access vs std::map O(log n))
+    int exponent_counts_arr[256] = {0};
+
     for (int i = 0; i < M * K; i++) {
         uint16_t bits = __bfloat16_as_ushort(matrix[i]);
         uint8_t exponent = (bits >> 7) & 0xFF;
-        exponent_map[exponent]++;
+        exponent_counts_arr[exponent]++;
     }
-    
-    // Build frequency pairs and sort
-    std::vector<std::pair<int, int>> exponent_counts(exponent_map.begin(), exponent_map.end());
-    std::sort(exponent_counts.begin(), exponent_counts.end(), 
+
+    // Build frequency pairs (ascending key order, same as std::map iteration) and sort
+    std::vector<std::pair<int, int>> exponent_counts;
+    exponent_counts.reserve(256);
+    for (int e = 0; e < 256; ++e) {
+        if (exponent_counts_arr[e] > 0) {
+            exponent_counts.push_back(std::make_pair(e, exponent_counts_arr[e]));
+        }
+    }
+    std::sort(exponent_counts.begin(), exponent_counts.end(),
               [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
                   return a.second > b.second;  // Sort by frequency in descending order
               });
-    
+
     // Extract original values of top_n exponents
     std::vector<int> original_top;
     for (int i = 0; i < std::min(top_n, (int)exponent_counts.size()); i++) {
         original_top.push_back(exponent_counts[i].first);
     }
-    
+
     // Fill with default values if fewer than top_n exponents found
     while (original_top.size() < top_n) {
         original_top.push_back(127 - original_top.size());
     }
-    
+
     // Sort original top exponents
     std::sort(original_top.begin(), original_top.end());
-    
+
     // Check continuity and handle outliers
     bool has_outlier = false;
     std::vector<int> continuous_top;
     int start_exp = original_top[0];
-    
+
     // Attempt to construct continuous exponent range
     for (int try_offset = 0; try_offset <= original_top.back() - start_exp; try_offset++) {
         continuous_top.clear();
         int current_exp = start_exp + try_offset;
         int found_count = 0;
-        
+
         // Attempt to construct continuous sequence starting with current_exp
         for (int i = 0; i < top_n; i++) {
-            if (exponent_map.count(current_exp + i) > 0) {
+            if (current_exp + i < 256 && exponent_counts_arr[current_exp + i] > 0) {
                 continuous_top.push_back(current_exp + i);
                 found_count++;
             }
         }
-        
+
         // If enough continuous exponents found
         if (found_count >= top_n) {
             break;
@@ -285,20 +291,20 @@ void analyzeExponentDistribution_BF16(__nv_bfloat16* matrix, int M, int K, int* 
         top_exponents[i] = continuous_top[i];
     }
     
-    // Output warning information
-    if (has_outlier) {
-        std::cerr << "WARNING: Original top exponents were not continuous. Constructed continuous range: ";
-        for (int i = 0; i < top_n; i++ ) {
-            std::cerr << top_exponents[i] << " ";
-        }
-        std::cerr << std::endl;
+    // // Output warning information
+    // if (has_outlier) {
+    //     std::cerr << "WARNING: Original top exponents were not continuous. Constructed continuous range: ";
+    //     for (int i = 0; i < top_n; i++ ) {
+    //         std::cerr << top_exponents[i] << " ";
+    //     }
+    //     std::cerr << std::endl;
         
-        std::cerr << "Original top exponents (sorted): ";
-        for (int exp : original_top) {
-            std::cerr << exp << " ";
-        }
-        std::cerr << std::endl;
-    }
+    //     std::cerr << "Original top exponents (sorted): ";
+    //     for (int exp : original_top) {
+    //         std::cerr << exp << " ";
+    //     }
+    //     std::cerr << std::endl;
+    // }
 }
 
 
