@@ -189,11 +189,23 @@ double ComputeTotalError_BF16(const __nv_bfloat16* A, const __nv_bfloat16* B, in
 void analyzeExponentDistribution_BF16(__nv_bfloat16* matrix, int M, int K, int* top_exponents, int top_n = 7) {
     // Count exponent distribution using fixed-size array (O(1) access vs std::map O(log n))
     int exponent_counts_arr[256] = {0};
+    const int total_elements = M * K;
 
-    for (int i = 0; i < M * K; i++) {
-        uint16_t bits = __bfloat16_as_ushort(matrix[i]);
-        uint8_t exponent = (bits >> 7) & 0xFF;
-        exponent_counts_arr[exponent]++;
+    #pragma omp parallel
+    {
+        int local_counts[256] = {0};
+        #pragma omp for nowait schedule(static)
+        for (int i = 0; i < total_elements; i++) {
+            uint16_t bits = __bfloat16_as_ushort(matrix[i]);
+            uint8_t exponent = (bits >> 7) & 0xFF;
+            local_counts[exponent]++;
+        }
+        #pragma omp critical
+        {
+            for (int e = 0; e < 256; ++e) {
+                exponent_counts_arr[e] += local_counts[e];
+            }
+        }
     }
 
     // Build frequency pairs (ascending key order, same as std::map iteration) and sort
