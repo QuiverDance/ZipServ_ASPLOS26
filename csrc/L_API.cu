@@ -552,3 +552,234 @@ __host__ int InitBF16MatrixTripleBitmap(
     
     return num_global_tiles;
 }
+
+__host__ int InitBF16MatrixTripleBitmap_Reuse(
+    __nv_bfloat16* A_bf16,
+    int M,
+    int K,
+    int tile_M,
+    int tile_M_median,
+    int tile_M_global,
+    int tile_K,
+    int tile_K_median,
+    int tile_K_global,
+    const int* top_exponents,
+    uint8_t* sign_mantissa,
+    __nv_bfloat16* compressed_full,
+    uint64_t* bitmap1,
+    uint64_t* bitmap2,
+    uint64_t* bitmap3,
+    int* TileOffsets,
+    int* TileOffsets_median,
+    int* TileOffsets_global,
+    uint8_t* temp_sm,
+    __nv_bfloat16* temp_full,
+    int* gt_hf_count,
+    int* gt_full_count,
+    int* hf_offsets,
+    int* full_offsets,
+    int& max_high_freq_count,
+    int& max_full_count,
+    int& out_total_hf,
+    int& out_total_full)
+{
+    if (A_bf16 == nullptr || top_exponents == nullptr ||
+        sign_mantissa == nullptr || compressed_full == nullptr ||
+        bitmap1 == nullptr || bitmap2 == nullptr || bitmap3 == nullptr ||
+        TileOffsets == nullptr || TileOffsets_median == nullptr || TileOffsets_global == nullptr ||
+        temp_sm == nullptr || temp_full == nullptr ||
+        gt_hf_count == nullptr || gt_full_count == nullptr ||
+        hf_offsets == nullptr || full_offsets == nullptr) {
+        return -1;
+    }
+    if (M <= 0 || K <= 0 || tile_M <= 0 || tile_M_median <= 0 || tile_M_global <= 0 ||
+        tile_K <= 0 || tile_K_median <= 0 || tile_K_global <= 0) {
+        return -1;
+    }
+
+    const int num_tiles_M = M / tile_M;
+    const int num_tiles_K = K / tile_K;
+    const int num_tiles = num_tiles_M * num_tiles_K;
+
+    const int num_median_tiles_M = M / tile_M_median;
+    const int num_median_tiles_K = K / tile_K_median;
+    const int num_median_tiles = num_median_tiles_M * num_median_tiles_K;
+
+    const int num_global_tiles_M = M / tile_M_global;
+    const int num_global_tiles_K = K / tile_K_global;
+    const int num_global_tiles = num_global_tiles_M * num_global_tiles_K;
+    if (num_global_tiles <= 0) {
+        return -1;
+    }
+
+    (void)temp_sm;
+    (void)temp_full;
+
+    memset(compressed_full, 0, static_cast<size_t>(M) * static_cast<size_t>(K) * sizeof(__nv_bfloat16));
+    memset(sign_mantissa, 0, static_cast<size_t>(M) * static_cast<size_t>(K));
+    memset(bitmap1, 0, static_cast<size_t>(num_tiles) * sizeof(uint64_t));
+    memset(bitmap2, 0, static_cast<size_t>(num_tiles) * sizeof(uint64_t));
+    memset(bitmap3, 0, static_cast<size_t>(num_tiles) * sizeof(uint64_t));
+    memset(TileOffsets, 0, static_cast<size_t>(num_tiles) * 2 * sizeof(int));
+    memset(TileOffsets_median, 0, static_cast<size_t>(num_median_tiles) * 2 * sizeof(int));
+    memset(TileOffsets_global, 0, static_cast<size_t>(num_global_tiles + 1) * 2 * sizeof(int));
+    memset(gt_hf_count, 0, static_cast<size_t>(num_global_tiles) * sizeof(int));
+    memset(gt_full_count, 0, static_cast<size_t>(num_global_tiles) * sizeof(int));
+    memset(hf_offsets, 0, static_cast<size_t>(num_global_tiles + 1) * sizeof(int));
+    memset(full_offsets, 0, static_cast<size_t>(num_global_tiles + 1) * sizeof(int));
+
+    int full_offset = 0;
+    int sign_mantissa_offset = 0;
+    int tile_idx = 0;
+    int median_offset_idx = 0;
+
+    max_high_freq_count = 0;
+    max_full_count = 0;
+    out_total_hf = 0;
+    out_total_full = 0;
+
+    for (int global_tile_m = 0; global_tile_m < num_global_tiles_M; ++global_tile_m) {
+        for (int global_tile_k = 0; global_tile_k < num_global_tiles_K; ++global_tile_k) {
+            const int global_row_start = global_tile_m * tile_M_global;
+            const int global_col_start = global_tile_k * tile_K_global;
+            int global_high_freq_count = 0;
+            int global_full_count = 0;
+
+            int median_high_freq_count = 0;
+            int median_full_count = 0;
+
+            TileOffsets_median[median_offset_idx * 2] = 0;
+            TileOffsets_median[median_offset_idx * 2 + 1] = 0;
+            median_offset_idx++;
+
+            for (int median_tile_m = 0; median_tile_m < tile_M_global / tile_M_median; ++median_tile_m) {
+                for (int median_tile_k = 0; median_tile_k < tile_K_global / tile_K_median; ++median_tile_k) {
+                    const int median_row_start = global_row_start + median_tile_m * tile_M_median;
+                    const int median_col_start = global_col_start + median_tile_k * tile_K_median;
+
+                    int local_median_high_freq = 0;
+                    int local_median_full = 0;
+
+                    for (int local_tile_m_group = 0; local_tile_m_group < tile_M_median / tile_M; local_tile_m_group += 2) {
+                        for (int local_tile_k_group = 0; local_tile_k_group < tile_K_median / tile_K; local_tile_k_group += 2) {
+                            for (int j = 0; j < 2; ++j) {
+                                for (int i = 0; i < 2; ++i) {
+                                    const int local_tile_k = local_tile_k_group + j;
+                                    const int local_tile_m = local_tile_m_group + i;
+
+                                    const int col_start = median_col_start + local_tile_k * tile_K;
+                                    const int row_start = median_row_start + local_tile_m * tile_M;
+
+                                    uint64_t tile_bitmap1 = 0;
+                                    uint64_t tile_bitmap2 = 0;
+                                    uint64_t tile_bitmap3 = 0;
+                                    int tile_high_freq_count = 0;
+                                    int tile_full_count = 0;
+
+                                    for (int row_offset = 0; row_offset < tile_M; ++row_offset) {
+                                        for (int col_offset = 0; col_offset < tile_K; ++col_offset) {
+                                            const int row = row_start + row_offset;
+                                            const int col = col_start + col_offset;
+                                            const int pos = row_offset * tile_K + col_offset;
+
+                                            if (row < M && col < K) {
+                                                const __nv_bfloat16 val = A_bf16[row * K + col];
+
+                                                const uint16_t bf16_bits = __bfloat16_as_ushort(val);
+                                                const uint8_t sign = (bf16_bits >> 15) & 0x1;
+                                                const uint8_t exponent = (bf16_bits >> 7) & 0xFF;
+                                                const uint8_t mantissa = bf16_bits & 0x7F;
+
+                                                int exp_idx = -1;
+                                                for (int e = 0; e < 7; ++e) {
+                                                    if (exponent == top_exponents[e]) {
+                                                        exp_idx = e;
+                                                        break;
+                                                    }
+                                                }
+
+                                                if (exp_idx >= 0) {
+                                                    const int bitmap_code = exp_idx + 1;
+                                                    tile_bitmap1 |= ((bitmap_code & 0x1) ? (1ULL << pos) : 0);
+                                                    tile_bitmap2 |= ((bitmap_code & 0x2) ? (1ULL << pos) : 0);
+                                                    tile_bitmap3 |= ((bitmap_code & 0x4) ? (1ULL << pos) : 0);
+
+                                                    const uint8_t combined = ((sign & 0x1) << 7) | (mantissa & 0x7F);
+                                                    sign_mantissa[sign_mantissa_offset++] = combined;
+
+                                                    tile_high_freq_count++;
+                                                    local_median_high_freq++;
+                                                    global_high_freq_count++;
+                                                } else {
+                                                    compressed_full[full_offset++] = val;
+                                                    tile_full_count++;
+                                                    local_median_full++;
+                                                    global_full_count++;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    bitmap1[tile_idx] = tile_bitmap1;
+                                    bitmap2[tile_idx] = tile_bitmap2;
+                                    bitmap3[tile_idx] = tile_bitmap3;
+                                    TileOffsets[tile_idx * 2] = tile_high_freq_count;
+                                    TileOffsets[tile_idx * 2 + 1] = tile_full_count;
+                                    ++tile_idx;
+                                }
+                            }
+                        }
+                    }
+
+                    if (median_tile_m < (tile_M_global / tile_M_median - 1) ||
+                        median_tile_k < (tile_K_global / tile_K_median - 1)) {
+                        median_high_freq_count += local_median_high_freq;
+                        median_full_count += local_median_full;
+
+                        TileOffsets_median[median_offset_idx * 2] = median_high_freq_count;
+                        TileOffsets_median[median_offset_idx * 2 + 1] = median_full_count;
+                        median_offset_idx++;
+                    }
+                }
+            }
+
+            const int high_freq_padding = (16 - (global_high_freq_count % 16)) % 16;
+            for (int p = 0; p < high_freq_padding; ++p) {
+                sign_mantissa[sign_mantissa_offset++] = 0;
+            }
+            global_high_freq_count += high_freq_padding;
+
+            const int full_padding = (8 - (global_full_count % 8)) % 8;
+            for (int p = 0; p < full_padding; ++p) {
+                compressed_full[full_offset++] = __float2bfloat16(0.0f);
+            }
+            global_full_count += full_padding;
+
+            const int global_idx = global_tile_m * num_global_tiles_K + global_tile_k;
+            gt_hf_count[global_idx] = global_high_freq_count;
+            gt_full_count[global_idx] = global_full_count;
+            hf_offsets[global_idx + 1] = global_high_freq_count;
+            full_offsets[global_idx + 1] = global_full_count;
+
+            if (global_high_freq_count > max_high_freq_count) {
+                max_high_freq_count = global_high_freq_count;
+            }
+            if (global_full_count > max_full_count) {
+                max_full_count = global_full_count;
+            }
+        }
+    }
+
+    TileOffsets_global[0] = 0;
+    TileOffsets_global[1] = 0;
+    for (int i = 1; i <= num_global_tiles; ++i) {
+        hf_offsets[i] += hf_offsets[i - 1];
+        full_offsets[i] += full_offsets[i - 1];
+        TileOffsets_global[i * 2] = hf_offsets[i];
+        TileOffsets_global[i * 2 + 1] = full_offsets[i];
+    }
+
+    out_total_hf = hf_offsets[num_global_tiles];
+    out_total_full = full_offsets[num_global_tiles];
+    return num_global_tiles;
+}
