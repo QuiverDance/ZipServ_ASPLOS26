@@ -16,7 +16,7 @@ NVCC          := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
 
 # internal flags
 NVCCFLAGS   := -m$(shell getconf LONG_BIT)
-CCFLAGS     := -fPIC
+CCFLAGS     := -fPIC -fopenmp -O3 -march=native
 LDFLAGS     :=
 
 ALL_CCFLAGS :=
@@ -29,7 +29,7 @@ ALL_LDFLAGS += $(addprefix -Xlinker ,$(LDFLAGS))
 
 # Common includes and paths for CUDA
 INCLUDES  := -I/usr/local/cuda/include/
-LIBRARIES := -lcublas
+LIBRARIES := -lcublas -lgomp
 
 ################################################################################
 
