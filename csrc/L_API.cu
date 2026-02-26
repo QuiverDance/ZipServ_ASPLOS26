@@ -17,6 +17,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstring>
+#include <omp.h>
 
 cudaError_t LaunchKernelWithConfig_4Param(
     cudaStream_t stream,
@@ -557,13 +559,14 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse(
     __nv_bfloat16* A_bf16,
     int M,
     int K,
-    int tile_M,
-    int tile_M_median,
-    int tile_M_global,
-    int tile_K,
-    int tile_K_median,
-    int tile_K_global,
+    int tile_M,          // 8
+    int tile_M_median,   // 16
+    int tile_M_global,   // 64
+    int tile_K,          // 8
+    int tile_K_median,   // 64
+    int tile_K_global,   // 64
     const int* top_exponents,
+    // Pre-allocated output buffers
     uint8_t* sign_mantissa,
     __nv_bfloat16* compressed_full,
     uint64_t* bitmap1,
@@ -572,31 +575,19 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse(
     int* TileOffsets,
     int* TileOffsets_median,
     int* TileOffsets_global,
+    // Pre-allocated temp workspace
     uint8_t* temp_sm,
     __nv_bfloat16* temp_full,
     int* gt_hf_count,
     int* gt_full_count,
     int* hf_offsets,
     int* full_offsets,
+    // Outputs
     int& max_high_freq_count,
     int& max_full_count,
     int& out_total_hf,
     int& out_total_full)
 {
-    if (A_bf16 == nullptr || top_exponents == nullptr ||
-        sign_mantissa == nullptr || compressed_full == nullptr ||
-        bitmap1 == nullptr || bitmap2 == nullptr || bitmap3 == nullptr ||
-        TileOffsets == nullptr || TileOffsets_median == nullptr || TileOffsets_global == nullptr ||
-        temp_sm == nullptr || temp_full == nullptr ||
-        gt_hf_count == nullptr || gt_full_count == nullptr ||
-        hf_offsets == nullptr || full_offsets == nullptr) {
-        return -1;
-    }
-    if (M <= 0 || K <= 0 || tile_M <= 0 || tile_M_median <= 0 || tile_M_global <= 0 ||
-        tile_K <= 0 || tile_K_median <= 0 || tile_K_global <= 0) {
-        return -1;
-    }
-
     const int num_tiles_M = M / tile_M;
     const int num_tiles_K = K / tile_K;
     const int num_tiles = num_tiles_M * num_tiles_K;
@@ -608,178 +599,174 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse(
     const int num_global_tiles_M = M / tile_M_global;
     const int num_global_tiles_K = K / tile_K_global;
     const int num_global_tiles = num_global_tiles_M * num_global_tiles_K;
-    if (num_global_tiles <= 0) {
-        return -1;
-    }
 
-    (void)temp_sm;
-    (void)temp_full;
+    const int small_per_global = (tile_M_global / tile_M) * (tile_K_global / tile_K);
+    const int median_per_global = (tile_M_global / tile_M_median) * (tile_K_global / tile_K_median);
+    const int small_per_median = small_per_global / median_per_global;
+    const int max_elem_per_gtile = tile_M_global * tile_K_global;
 
-    memset(compressed_full, 0, static_cast<size_t>(M) * static_cast<size_t>(K) * sizeof(__nv_bfloat16));
-    memset(sign_mantissa, 0, static_cast<size_t>(M) * static_cast<size_t>(K));
-    memset(bitmap1, 0, static_cast<size_t>(num_tiles) * sizeof(uint64_t));
-    memset(bitmap2, 0, static_cast<size_t>(num_tiles) * sizeof(uint64_t));
-    memset(bitmap3, 0, static_cast<size_t>(num_tiles) * sizeof(uint64_t));
-    memset(TileOffsets, 0, static_cast<size_t>(num_tiles) * 2 * sizeof(int));
-    memset(TileOffsets_median, 0, static_cast<size_t>(num_median_tiles) * 2 * sizeof(int));
-    memset(TileOffsets_global, 0, static_cast<size_t>(num_global_tiles + 1) * 2 * sizeof(int));
-    memset(gt_hf_count, 0, static_cast<size_t>(num_global_tiles) * sizeof(int));
-    memset(gt_full_count, 0, static_cast<size_t>(num_global_tiles) * sizeof(int));
-    memset(hf_offsets, 0, static_cast<size_t>(num_global_tiles + 1) * sizeof(int));
-    memset(full_offsets, 0, static_cast<size_t>(num_global_tiles + 1) * sizeof(int));
+    const int max_sm_per_gtile = max_elem_per_gtile + 15;
+    const int max_full_per_gtile = max_elem_per_gtile + 7;
 
-    int full_offset = 0;
-    int sign_mantissa_offset = 0;
-    int tile_idx = 0;
-    int median_offset_idx = 0;
+    // Exponent lookup table
+    uint8_t exp_to_idx[256];
+    memset(exp_to_idx, 0xFF, 256);
+    for (int e = 0; e < 7; e++)
+        exp_to_idx[top_exponents[e]] = (uint8_t)e;
 
-    max_high_freq_count = 0;
-    max_full_count = 0;
-    out_total_hf = 0;
-    out_total_full = 0;
-
-    for (int global_tile_m = 0; global_tile_m < num_global_tiles_M; ++global_tile_m) {
-        for (int global_tile_k = 0; global_tile_k < num_global_tiles_K; ++global_tile_k) {
-            const int global_row_start = global_tile_m * tile_M_global;
-            const int global_col_start = global_tile_k * tile_K_global;
-            int global_high_freq_count = 0;
-            int global_full_count = 0;
-
-            int median_high_freq_count = 0;
-            int median_full_count = 0;
-
-            TileOffsets_median[median_offset_idx * 2] = 0;
-            TileOffsets_median[median_offset_idx * 2 + 1] = 0;
-            median_offset_idx++;
-
-            for (int median_tile_m = 0; median_tile_m < tile_M_global / tile_M_median; ++median_tile_m) {
-                for (int median_tile_k = 0; median_tile_k < tile_K_global / tile_K_median; ++median_tile_k) {
-                    const int median_row_start = global_row_start + median_tile_m * tile_M_median;
-                    const int median_col_start = global_col_start + median_tile_k * tile_K_median;
-
-                    int local_median_high_freq = 0;
-                    int local_median_full = 0;
-
-                    for (int local_tile_m_group = 0; local_tile_m_group < tile_M_median / tile_M; local_tile_m_group += 2) {
-                        for (int local_tile_k_group = 0; local_tile_k_group < tile_K_median / tile_K; local_tile_k_group += 2) {
-                            for (int j = 0; j < 2; ++j) {
-                                for (int i = 0; i < 2; ++i) {
-                                    const int local_tile_k = local_tile_k_group + j;
-                                    const int local_tile_m = local_tile_m_group + i;
-
-                                    const int col_start = median_col_start + local_tile_k * tile_K;
-                                    const int row_start = median_row_start + local_tile_m * tile_M;
-
-                                    uint64_t tile_bitmap1 = 0;
-                                    uint64_t tile_bitmap2 = 0;
-                                    uint64_t tile_bitmap3 = 0;
-                                    int tile_high_freq_count = 0;
-                                    int tile_full_count = 0;
-
-                                    for (int row_offset = 0; row_offset < tile_M; ++row_offset) {
-                                        for (int col_offset = 0; col_offset < tile_K; ++col_offset) {
-                                            const int row = row_start + row_offset;
-                                            const int col = col_start + col_offset;
-                                            const int pos = row_offset * tile_K + col_offset;
-
-                                            if (row < M && col < K) {
-                                                const __nv_bfloat16 val = A_bf16[row * K + col];
-
-                                                const uint16_t bf16_bits = __bfloat16_as_ushort(val);
-                                                const uint8_t sign = (bf16_bits >> 15) & 0x1;
-                                                const uint8_t exponent = (bf16_bits >> 7) & 0xFF;
-                                                const uint8_t mantissa = bf16_bits & 0x7F;
-
-                                                int exp_idx = -1;
-                                                for (int e = 0; e < 7; ++e) {
-                                                    if (exponent == top_exponents[e]) {
-                                                        exp_idx = e;
-                                                        break;
-                                                    }
-                                                }
-
-                                                if (exp_idx >= 0) {
-                                                    const int bitmap_code = exp_idx + 1;
-                                                    tile_bitmap1 |= ((bitmap_code & 0x1) ? (1ULL << pos) : 0);
-                                                    tile_bitmap2 |= ((bitmap_code & 0x2) ? (1ULL << pos) : 0);
-                                                    tile_bitmap3 |= ((bitmap_code & 0x4) ? (1ULL << pos) : 0);
-
-                                                    const uint8_t combined = ((sign & 0x1) << 7) | (mantissa & 0x7F);
-                                                    sign_mantissa[sign_mantissa_offset++] = combined;
-
-                                                    tile_high_freq_count++;
-                                                    local_median_high_freq++;
-                                                    global_high_freq_count++;
-                                                } else {
-                                                    compressed_full[full_offset++] = val;
-                                                    tile_full_count++;
-                                                    local_median_full++;
-                                                    global_full_count++;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    bitmap1[tile_idx] = tile_bitmap1;
-                                    bitmap2[tile_idx] = tile_bitmap2;
-                                    bitmap3[tile_idx] = tile_bitmap3;
-                                    TileOffsets[tile_idx * 2] = tile_high_freq_count;
-                                    TileOffsets[tile_idx * 2 + 1] = tile_full_count;
-                                    ++tile_idx;
-                                }
+    // Precompute small tile layout within a global tile (flattened from 7-level nesting).
+    const int num_median_m = tile_M_global / tile_M_median;
+    const int num_median_k = tile_K_global / tile_K_median;
+    const int num_small_m = tile_M_median / tile_M;
+    const int num_small_k = tile_K_median / tile_K;
+    struct TilePos { int row_off; int col_off; };
+    TilePos tile_pos[256];
+    {
+        int tp_idx = 0;
+        for (int mm = 0; mm < num_median_m; ++mm) {
+            for (int mk = 0; mk < num_median_k; ++mk) {
+                const int med_row = mm * tile_M_median;
+                const int med_col = mk * tile_K_median;
+                for (int mg = 0; mg < num_small_m; mg += 2) {
+                    for (int kg = 0; kg < num_small_k; kg += 2) {
+                        for (int j = 0; j < 2; ++j) {
+                            for (int i = 0; i < 2; ++i) {
+                                tile_pos[tp_idx].row_off = med_row + (mg + i) * tile_M;
+                                tile_pos[tp_idx].col_off = med_col + (kg + j) * tile_K;
+                                ++tp_idx;
                             }
                         }
                     }
-
-                    if (median_tile_m < (tile_M_global / tile_M_median - 1) ||
-                        median_tile_k < (tile_K_global / tile_K_median - 1)) {
-                        median_high_freq_count += local_median_high_freq;
-                        median_full_count += local_median_full;
-
-                        TileOffsets_median[median_offset_idx * 2] = median_high_freq_count;
-                        TileOffsets_median[median_offset_idx * 2 + 1] = median_full_count;
-                        median_offset_idx++;
-                    }
                 }
-            }
-
-            const int high_freq_padding = (16 - (global_high_freq_count % 16)) % 16;
-            for (int p = 0; p < high_freq_padding; ++p) {
-                sign_mantissa[sign_mantissa_offset++] = 0;
-            }
-            global_high_freq_count += high_freq_padding;
-
-            const int full_padding = (8 - (global_full_count % 8)) % 8;
-            for (int p = 0; p < full_padding; ++p) {
-                compressed_full[full_offset++] = __float2bfloat16(0.0f);
-            }
-            global_full_count += full_padding;
-
-            const int global_idx = global_tile_m * num_global_tiles_K + global_tile_k;
-            gt_hf_count[global_idx] = global_high_freq_count;
-            gt_full_count[global_idx] = global_full_count;
-            hf_offsets[global_idx + 1] = global_high_freq_count;
-            full_offsets[global_idx + 1] = global_full_count;
-
-            if (global_high_freq_count > max_high_freq_count) {
-                max_high_freq_count = global_high_freq_count;
-            }
-            if (global_full_count > max_full_count) {
-                max_full_count = global_full_count;
             }
         }
     }
 
+    // ========== Pass 1: single-pass processing with flattened tile loop ==========
+    #pragma omp parallel for schedule(dynamic) if(num_global_tiles >= 8)
+    for (int gt = 0; gt < num_global_tiles; ++gt) {
+        const int gm = gt / num_global_tiles_K;
+        const int gk = gt % num_global_tiles_K;
+        const int grow = gm * tile_M_global;
+        const int gcol = gk * tile_K_global;
+
+        uint8_t* my_sm = temp_sm + (size_t)gt * max_sm_per_gtile;
+        __nv_bfloat16* my_full = temp_full + (size_t)gt * max_full_per_gtile;
+        int sm_idx = 0;
+        int full_idx = 0;
+
+        const int base_tile_idx = gt * small_per_global;
+        const int base_median_idx = gt * median_per_global;
+        int cum_median_hf = 0;
+        int cum_median_full = 0;
+        int cur_median_hf = 0;
+        int cur_median_full = 0;
+        int local_median_idx = 1;
+
+        TileOffsets_median[base_median_idx * 2] = 0;
+        TileOffsets_median[base_median_idx * 2 + 1] = 0;
+
+        for (int st = 0; st < small_per_global; ++st) {
+            const int row_start = grow + tile_pos[st].row_off;
+            const int col_start = gcol + tile_pos[st].col_off;
+
+            uint64_t tb1 = 0, tb2 = 0, tb3 = 0;
+            int t_hf = 0, t_full = 0;
+
+            for (int ro = 0; ro < tile_M; ++ro) {
+                const __nv_bfloat16* row_ptr = A_bf16 + (row_start + ro) * K + col_start;
+                for (int co = 0; co < tile_K; ++co) {
+                    const int pos = ro * tile_K + co;
+                    const __nv_bfloat16 val = row_ptr[co];
+                    const uint16_t bf16_bits = __bfloat16_as_ushort(val);
+                    const uint8_t sign = (bf16_bits >> 15) & 0x1;
+                    const uint8_t exponent = (bf16_bits >> 7) & 0xFF;
+                    const uint8_t mantissa = bf16_bits & 0x7F;
+
+                    const uint8_t eidx = exp_to_idx[exponent];
+                    if (eidx != 0xFF) {
+                        const int bitmap_code = eidx + 1;
+                        tb1 |= ((bitmap_code & 0x1) ? 1ULL << pos : 0);
+                        tb2 |= ((bitmap_code & 0x2) ? 1ULL << pos : 0);
+                        tb3 |= ((bitmap_code & 0x4) ? 1ULL << pos : 0);
+                        my_sm[sm_idx++] = ((sign & 0x1) << 7) | (mantissa & 0x7F);
+                        t_hf++;
+                    } else {
+                        my_full[full_idx++] = val;
+                        t_full++;
+                    }
+                }
+            }
+
+            const int tidx = base_tile_idx + st;
+            bitmap1[tidx] = tb1;
+            bitmap2[tidx] = tb2;
+            bitmap3[tidx] = tb3;
+            TileOffsets[tidx * 2] = t_hf;
+            TileOffsets[tidx * 2 + 1] = t_full;
+
+            cur_median_hf += t_hf;
+            cur_median_full += t_full;
+
+            if ((st % small_per_median) == (small_per_median - 1)) {
+                const int mid = st / small_per_median;
+                if (mid < median_per_global - 1) {
+                    cum_median_hf += cur_median_hf;
+                    cum_median_full += cur_median_full;
+                    const int midx = base_median_idx + local_median_idx;
+                    TileOffsets_median[midx * 2] = cum_median_hf;
+                    TileOffsets_median[midx * 2 + 1] = cum_median_full;
+                    local_median_idx++;
+                }
+                cur_median_hf = 0;
+                cur_median_full = 0;
+            }
+        }
+
+        const int hf_pad = (16 - (sm_idx % 16)) % 16;
+        for (int p = 0; p < hf_pad; ++p)
+            my_sm[sm_idx++] = 0;
+
+        const int full_pad = (8 - (full_idx % 8)) % 8;
+        for (int p = 0; p < full_pad; ++p)
+            my_full[full_idx++] = __float2bfloat16(0.0f);
+
+        gt_hf_count[gt] = sm_idx;
+        gt_full_count[gt] = full_idx;
+    }
+
+    // ========== Pass 2: prefix sum ==========
+    max_high_freq_count = 0;
+    max_full_count = 0;
+    hf_offsets[0] = 0;
+    full_offsets[0] = 0;
+
     TileOffsets_global[0] = 0;
     TileOffsets_global[1] = 0;
-    for (int i = 1; i <= num_global_tiles; ++i) {
-        hf_offsets[i] += hf_offsets[i - 1];
-        full_offsets[i] += full_offsets[i - 1];
-        TileOffsets_global[i * 2] = hf_offsets[i];
-        TileOffsets_global[i * 2 + 1] = full_offsets[i];
+
+    for (int i = 0; i < num_global_tiles; ++i) {
+        hf_offsets[i + 1] = hf_offsets[i] + gt_hf_count[i];
+        full_offsets[i + 1] = full_offsets[i] + gt_full_count[i];
+        TileOffsets_global[(i + 1) * 2] = hf_offsets[i + 1];
+        TileOffsets_global[(i + 1) * 2 + 1] = full_offsets[i + 1];
+        if (gt_hf_count[i] > max_high_freq_count) max_high_freq_count = gt_hf_count[i];
+        if (gt_full_count[i] > max_full_count) max_full_count = gt_full_count[i];
     }
 
     out_total_hf = hf_offsets[num_global_tiles];
     out_total_full = full_offsets[num_global_tiles];
+
+    // ========== Pass 3: scatter from temp buffers to final arrays ==========
+    #pragma omp parallel for schedule(static) if(num_global_tiles >= 8)
+    for (int gt = 0; gt < num_global_tiles; ++gt) {
+        if (gt_hf_count[gt] > 0)
+            memcpy(sign_mantissa + hf_offsets[gt],
+                   temp_sm + (size_t)gt * max_sm_per_gtile, gt_hf_count[gt]);
+        if (gt_full_count[gt] > 0)
+            memcpy(compressed_full + full_offsets[gt],
+                   temp_full + (size_t)gt * max_full_per_gtile,
+                   gt_full_count[gt] * sizeof(__nv_bfloat16));
+    }
+
     return num_global_tiles;
 }
