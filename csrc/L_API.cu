@@ -19,6 +19,7 @@
 #include <vector>
 #include <cstring>
 #include <omp.h>
+#include <immintrin.h>
 
 cudaError_t LaunchKernelWithConfig_4Param(
     cudaStream_t stream,
@@ -754,6 +755,290 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse(
     }
 
     out_total_hf = hf_offsets[num_global_tiles];
+    out_total_full = full_offsets[num_global_tiles];
+
+    // ========== Pass 3: scatter from temp buffers to final arrays ==========
+    #pragma omp parallel for schedule(static) if(num_global_tiles >= 8)
+    for (int gt = 0; gt < num_global_tiles; ++gt) {
+        if (gt_hf_count[gt] > 0)
+            memcpy(sign_mantissa + hf_offsets[gt],
+                   temp_sm + (size_t)gt * max_sm_per_gtile, gt_hf_count[gt]);
+        if (gt_full_count[gt] > 0)
+            memcpy(compressed_full + full_offsets[gt],
+                   temp_full + (size_t)gt * max_full_per_gtile,
+                   gt_full_count[gt] * sizeof(__nv_bfloat16));
+    }
+
+    return num_global_tiles;
+}
+
+// ---------------------------------------------------------------------------
+// Precomputed shuffle masks for SIMD compress-store (indexed by 8-bit mask).
+// Entry[mask] rearranges the bytes selected by `mask` to the front so that
+// _mm_storel_epi64 writes them contiguously.
+// ---------------------------------------------------------------------------
+static __m128i s_compress_lut[256];
+static bool    s_compress_lut_inited = false;
+
+static void init_compress_lut() {
+    if (s_compress_lut_inited) return;
+    for (int mask = 0; mask < 256; ++mask) {
+        alignas(16) uint8_t indices[16];
+        int pos = 0;
+        for (int b = 0; b < 8; ++b) {
+            if (mask & (1 << b))
+                indices[pos++] = (uint8_t)b;
+        }
+        for (int i = pos; i < 16; ++i)
+            indices[i] = 0x80;
+        s_compress_lut[mask] = _mm_load_si128((const __m128i*)indices);
+    }
+    s_compress_lut_inited = true;
+}
+
+// SIMD-accelerated version of InitBF16MatrixTripleBitmap_Reuse.
+// The inner 8-element loop (one tile row) is replaced by SSE/SSSE3 vector ops:
+//   - Range check replaces the 256-byte exp_to_idx LUT
+//   - Bitmap bits extracted via packs + movemask
+//   - sign_mantissa bytes compress-stored via pshufb + precomputed LUT
+//   - Full (outlier) elements scattered with scalar code (typically 0-2/row)
+// Pass 2 (prefix sum) and Pass 3 (memcpy scatter) are unchanged.
+__host__ int InitBF16MatrixTripleBitmap_Reuse_SIMD(
+    __nv_bfloat16* A_bf16,
+    int M,
+    int K,
+    int tile_M,
+    int tile_M_median,
+    int tile_M_global,
+    int tile_K,
+    int tile_K_median,
+    int tile_K_global,
+    const int* top_exponents,
+    // Pre-allocated output buffers
+    uint8_t* sign_mantissa,
+    __nv_bfloat16* compressed_full,
+    uint64_t* bitmap1,
+    uint64_t* bitmap2,
+    uint64_t* bitmap3,
+    int* TileOffsets,
+    int* TileOffsets_median,
+    int* TileOffsets_global,
+    // Pre-allocated temp workspace
+    uint8_t* temp_sm,
+    __nv_bfloat16* temp_full,
+    int* gt_hf_count,
+    int* gt_full_count,
+    int* hf_offsets,
+    int* full_offsets,
+    // Outputs
+    int& max_high_freq_count,
+    int& max_full_count,
+    int& out_total_hf,
+    int& out_total_full)
+{
+    init_compress_lut();
+
+    const int num_global_tiles_M = M / tile_M_global;
+    const int num_global_tiles_K = K / tile_K_global;
+    const int num_global_tiles   = num_global_tiles_M * num_global_tiles_K;
+
+    const int small_per_global  = (tile_M_global / tile_M) * (tile_K_global / tile_K);
+    const int median_per_global = (tile_M_global / tile_M_median) * (tile_K_global / tile_K_median);
+    const int small_per_median  = small_per_global / median_per_global;
+    const int max_elem_per_gtile = tile_M_global * tile_K_global;
+
+    const int max_sm_per_gtile   = max_elem_per_gtile + 15;
+    const int max_full_per_gtile = max_elem_per_gtile + 7;
+
+    // Top exponents are contiguous: [start_exp, start_exp + 6]
+    const int start_exp = top_exponents[0];
+
+    // Reinterpret BF16 input as uint16_t for SIMD loads
+    const uint16_t* A_u16 = reinterpret_cast<const uint16_t*>(A_bf16);
+
+    // Precompute small tile layout within a global tile (flattened from 7-level nesting)
+    const int num_median_m = tile_M_global / tile_M_median;
+    const int num_median_k = tile_K_global / tile_K_median;
+    const int num_small_m  = tile_M_median / tile_M;
+    const int num_small_k  = tile_K_median / tile_K;
+    struct TilePos { int row_off; int col_off; };
+    TilePos tile_pos[256];
+    {
+        int tp = 0;
+        for (int mm = 0; mm < num_median_m; ++mm)
+            for (int mk = 0; mk < num_median_k; ++mk) {
+                const int mr = mm * tile_M_median;
+                const int mc = mk * tile_K_median;
+                for (int mg = 0; mg < num_small_m; mg += 2)
+                    for (int kg = 0; kg < num_small_k; kg += 2)
+                        for (int j = 0; j < 2; ++j)
+                            for (int i = 0; i < 2; ++i) {
+                                tile_pos[tp].row_off = mr + (mg + i) * tile_M;
+                                tile_pos[tp].col_off = mc + (kg + j) * tile_K;
+                                ++tp;
+                            }
+            }
+    }
+
+    // SSE constant vectors
+    const __m128i v_start  = _mm_set1_epi16((short)start_exp);
+    const __m128i v_seven  = _mm_set1_epi16(7);
+    const __m128i v_neg1   = _mm_set1_epi16(-1);
+    const __m128i v_one    = _mm_set1_epi16(1);
+    const __m128i v_0xFF   = _mm_set1_epi16(0x00FF);
+    const __m128i v_0x80   = _mm_set1_epi16(0x0080);
+    const __m128i v_0x7F   = _mm_set1_epi16(0x007F);
+    const __m128i v_zero   = _mm_setzero_si128();
+
+    // ========== Pass 1: SIMD-accelerated processing ==========
+    #pragma omp parallel for schedule(dynamic) if(num_global_tiles >= 8)
+    for (int gt = 0; gt < num_global_tiles; ++gt) {
+        const int gm   = gt / num_global_tiles_K;
+        const int gk   = gt % num_global_tiles_K;
+        const int grow  = gm * tile_M_global;
+        const int gcol  = gk * tile_K_global;
+
+        uint8_t*  my_sm   = temp_sm + (size_t)gt * max_sm_per_gtile;
+        uint16_t* my_full = reinterpret_cast<uint16_t*>(temp_full + (size_t)gt * max_full_per_gtile);
+        int sm_idx   = 0;
+        int full_idx = 0;
+
+        const int base_tile_idx   = gt * small_per_global;
+        const int base_median_idx = gt * median_per_global;
+        int cum_median_hf   = 0;
+        int cum_median_full = 0;
+        int cur_median_hf   = 0;
+        int cur_median_full = 0;
+        int local_median_idx = 1;
+
+        TileOffsets_median[base_median_idx * 2]     = 0;
+        TileOffsets_median[base_median_idx * 2 + 1] = 0;
+
+        for (int st = 0; st < small_per_global; ++st) {
+            const int row_start = grow + tile_pos[st].row_off;
+            const int col_start = gcol + tile_pos[st].col_off;
+
+            uint64_t tb1 = 0, tb2 = 0, tb3 = 0;
+            int t_hf = 0, t_full = 0;
+
+            for (int ro = 0; ro < tile_M; ++ro) {
+                const uint16_t* row_ptr = A_u16 + (row_start + ro) * K + col_start;
+
+                // Load 8 × BF16 (uint16_t)
+                __m128i bits = _mm_loadu_si128((const __m128i*)row_ptr);
+
+                // Exponent: (bits >> 7) & 0xFF
+                __m128i exp_vec = _mm_and_si128(_mm_srli_epi16(bits, 7), v_0xFF);
+
+                // Range check: sub = exp - start; is_hf = (sub >= 0) && (sub < 7)
+                __m128i sub_vec  = _mm_sub_epi16(exp_vec, v_start);
+                __m128i ge_zero  = _mm_cmpgt_epi16(sub_vec, v_neg1);
+                __m128i lt_seven = _mm_cmpgt_epi16(v_seven, sub_vec);
+                __m128i is_hf    = _mm_and_si128(ge_zero, lt_seven);
+
+                // 8-bit high-freq mask
+                int hf_mask = _mm_movemask_epi8(_mm_packs_epi16(is_hf, v_zero)) & 0xFF;
+                int n_hf    = __builtin_popcount(hf_mask);
+
+                // bitmap_code = (sub + 1) masked to hf-only lanes
+                __m128i bc = _mm_and_si128(_mm_add_epi16(sub_vec, v_one), is_hf);
+
+                // Extract bitmap bits and merge into tb1/tb2/tb3
+                __m128i b0 = _mm_cmpeq_epi16(_mm_and_si128(bc, v_one), v_one);
+                int tb1_bits = _mm_movemask_epi8(_mm_packs_epi16(b0, v_zero)) & 0xFF;
+
+                __m128i b1 = _mm_cmpeq_epi16(_mm_and_si128(_mm_srli_epi16(bc, 1), v_one), v_one);
+                int tb2_bits = _mm_movemask_epi8(_mm_packs_epi16(b1, v_zero)) & 0xFF;
+
+                __m128i b2 = _mm_cmpeq_epi16(_mm_and_si128(_mm_srli_epi16(bc, 2), v_one), v_one);
+                int tb3_bits = _mm_movemask_epi8(_mm_packs_epi16(b2, v_zero)) & 0xFF;
+
+                tb1 |= (uint64_t)tb1_bits << (ro * 8);
+                tb2 |= (uint64_t)tb2_bits << (ro * 8);
+                tb3 |= (uint64_t)tb3_bits << (ro * 8);
+
+                // sign_mantissa: sm = ((bits >> 8) & 0x80) | (bits & 0x7F)
+                __m128i sm16 = _mm_or_si128(
+                    _mm_and_si128(_mm_srli_epi16(bits, 8), v_0x80),
+                    _mm_and_si128(bits, v_0x7F));
+                __m128i sm8 = _mm_packus_epi16(sm16, v_zero);
+
+                // Compress-store: shuffle hf bytes to front, then store
+                __m128i compressed = _mm_shuffle_epi8(sm8, s_compress_lut[hf_mask]);
+                _mm_storel_epi64((__m128i*)(my_sm + sm_idx), compressed);
+                sm_idx += n_hf;
+                t_hf   += n_hf;
+
+                // Full elements (scalar, typically 0-2 per row)
+                int fm = (~hf_mask) & 0xFF;
+                if (fm) {
+                    uint16_t row_vals[8];
+                    _mm_storeu_si128((__m128i*)row_vals, bits);
+                    while (fm) {
+                        int b = __builtin_ctz(fm);
+                        my_full[full_idx++] = row_vals[b];
+                        t_full++;
+                        fm &= fm - 1;
+                    }
+                }
+            }
+
+            const int tidx = base_tile_idx + st;
+            bitmap1[tidx] = tb1;
+            bitmap2[tidx] = tb2;
+            bitmap3[tidx] = tb3;
+            TileOffsets[tidx * 2]     = t_hf;
+            TileOffsets[tidx * 2 + 1] = t_full;
+
+            cur_median_hf   += t_hf;
+            cur_median_full += t_full;
+
+            if ((st % small_per_median) == (small_per_median - 1)) {
+                const int mid = st / small_per_median;
+                if (mid < median_per_global - 1) {
+                    cum_median_hf   += cur_median_hf;
+                    cum_median_full += cur_median_full;
+                    const int midx = base_median_idx + local_median_idx;
+                    TileOffsets_median[midx * 2]     = cum_median_hf;
+                    TileOffsets_median[midx * 2 + 1] = cum_median_full;
+                    local_median_idx++;
+                }
+                cur_median_hf   = 0;
+                cur_median_full = 0;
+            }
+        }
+
+        const int hf_pad = (16 - (sm_idx % 16)) % 16;
+        for (int p = 0; p < hf_pad; ++p)
+            my_sm[sm_idx++] = 0;
+
+        const int full_pad = (8 - (full_idx % 8)) % 8;
+        for (int p = 0; p < full_pad; ++p)
+            my_full[full_idx++] = 0;
+
+        gt_hf_count[gt]  = sm_idx;
+        gt_full_count[gt] = full_idx;
+    }
+
+    // ========== Pass 2: prefix sum ==========
+    max_high_freq_count = 0;
+    max_full_count      = 0;
+    hf_offsets[0]   = 0;
+    full_offsets[0] = 0;
+
+    TileOffsets_global[0] = 0;
+    TileOffsets_global[1] = 0;
+
+    for (int i = 0; i < num_global_tiles; ++i) {
+        hf_offsets[i + 1]   = hf_offsets[i]   + gt_hf_count[i];
+        full_offsets[i + 1] = full_offsets[i]  + gt_full_count[i];
+        TileOffsets_global[(i + 1) * 2]     = hf_offsets[i + 1];
+        TileOffsets_global[(i + 1) * 2 + 1] = full_offsets[i + 1];
+        if (gt_hf_count[i] > max_high_freq_count) max_high_freq_count = gt_hf_count[i];
+        if (gt_full_count[i] > max_full_count) max_full_count = gt_full_count[i];
+    }
+
+    out_total_hf   = hf_offsets[num_global_tiles];
     out_total_full = full_offsets[num_global_tiles];
 
     // ========== Pass 3: scatter from temp buffers to final arrays ==========
