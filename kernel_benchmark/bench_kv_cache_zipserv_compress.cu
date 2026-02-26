@@ -124,8 +124,6 @@ struct BenchRow {
     std::string file_name;
     std::string tensor_label;
     int tensor_id = -1;
-    int pair_index = -1;
-    int pair_slot = -1;
 
     std::string shape3d;
     std::string mapped_shape;
@@ -339,22 +337,6 @@ bool FilePassesExtensionFilter(const std::string& path, const std::set<std::stri
     }
     const std::string ext = GetExtensionNoDotLower(path);
     return ext_filter.find(ext) != ext_filter.end();
-}
-
-bool IsRegularFile(const std::string& path, struct stat* out_stat, std::string* error) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        if (error != nullptr) {
-            std::ostringstream oss;
-            oss << "stat failed for " << path << ": " << std::strerror(errno);
-            *error = oss.str();
-        }
-        return false;
-    }
-    if (out_stat != nullptr) {
-        *out_stat = st;
-    }
-    return S_ISREG(st.st_mode);
 }
 
 bool IsDirectory(const std::string& path, std::string* error) {
@@ -686,70 +668,6 @@ std::string FormatExponentList(const std::array<int, 7>& exponents) {
     return oss.str();
 }
 
-void CollectExponentCoverage(const std::vector<__nv_bfloat16>& matrix,
-                             const std::array<int, 7>& selected_exponents,
-                             std::array<int, 7>* raw_top_exponents,
-                             double* raw_cover,
-                             double* selected_cover) {
-    int exponent_counts[256] = {0};
-    for (size_t i = 0; i < matrix.size(); ++i) {
-        const uint16_t bits = __bfloat16_as_ushort(matrix[i]);
-        const uint8_t exponent = static_cast<uint8_t>((bits >> 7) & 0xFF);
-        ++exponent_counts[exponent];
-    }
-
-    std::vector<std::pair<int, int>> sorted;
-    sorted.reserve(256);
-    for (int exponent = 0; exponent < 256; ++exponent) {
-        if (exponent_counts[exponent] > 0) {
-            sorted.push_back(std::make_pair(exponent, exponent_counts[exponent]));
-        }
-    }
-    std::sort(sorted.begin(), sorted.end(),
-              [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                  if (a.second != b.second) {
-                      return a.second > b.second;
-                  }
-                  return a.first < b.first;
-              });
-
-    raw_top_exponents->fill(-1);
-    for (size_t i = 0; i < raw_top_exponents->size() && i < sorted.size(); ++i) {
-        (*raw_top_exponents)[i] = sorted[i].first;
-    }
-
-    bool raw_mask[256] = {false};
-    bool selected_mask[256] = {false};
-
-    for (size_t i = 0; i < raw_top_exponents->size(); ++i) {
-        if ((*raw_top_exponents)[i] >= 0) {
-            raw_mask[(*raw_top_exponents)[i]] = true;
-        }
-        if (selected_exponents[i] >= 0 && selected_exponents[i] < 256) {
-            selected_mask[selected_exponents[i]] = true;
-        }
-    }
-
-    size_t raw_count = 0;
-    size_t selected_count = 0;
-    for (int exponent = 0; exponent < 256; ++exponent) {
-        if (raw_mask[exponent]) {
-            raw_count += static_cast<size_t>(exponent_counts[exponent]);
-        }
-        if (selected_mask[exponent]) {
-            selected_count += static_cast<size_t>(exponent_counts[exponent]);
-        }
-    }
-
-    const size_t total = matrix.size();
-    *raw_cover = (total > 0)
-                     ? static_cast<double>(raw_count) / static_cast<double>(total)
-                     : 0.0;
-    *selected_cover = (total > 0)
-                          ? static_cast<double>(selected_count) / static_cast<double>(total)
-                          : 0.0;
-}
-
 // Lightweight coverage using pre-built histogram (avoids re-scanning data)
 void CollectExponentCoverageFromHistogram(
     const int* exponent_counts,
@@ -798,112 +716,8 @@ void CollectExponentCoverageFromHistogram(
                           : 0.0;
 }
 
-bool ConvertHeadSplitPadFp16ToBf16(const NpyInfo& info,
-                                   const std::vector<uint8_t>& raw,
-                                   int64_t seq_begin,
-                                   int64_t seq_count,
-                                   std::vector<__nv_bfloat16>* out,
-                                   int* mapped_rows,
-                                   int* mapped_cols,
-                                   int* padded_rows,
-                                   int* padded_cols,
-                                   size_t* logical_numel,
-                                   size_t* input_numel,
-                                   double* convert_ms,
-                                   std::string* error) {
-    if (info.shape.size() != 3) {
-        *error = "non_3d_shape";
-        return false;
-    }
-
-    const int64_t t = info.shape[0];
-    const int64_t h = info.shape[1];
-    const int64_t d = info.shape[2];
-    if (t <= 0 || h <= 0 || d <= 0) {
-        *error = "shape_has_non_positive_dimension";
-        return false;
-    }
-
-    if (h > std::numeric_limits<int>::max() || d > std::numeric_limits<int>::max()) {
-        *error = "shape_dimension_too_large";
-        return false;
-    }
-
-    if (seq_begin < 0 || seq_count <= 0 || seq_begin + seq_count > t) {
-        *error = "invalid_seq_chunk_range";
-        return false;
-    }
-
-    const int64_t rows64 = seq_count * h;
-    if (rows64 > std::numeric_limits<int>::max()) {
-        *error = "mapped_rows_overflow";
-        return false;
-    }
-
-    *mapped_rows = static_cast<int>(rows64);
-    *mapped_cols = static_cast<int>(d);
-    *padded_rows = RoundUpTo64(*mapped_rows);
-    *padded_cols = RoundUpTo64(*mapped_cols);
-
-    size_t logical_numel_local = 0;
-    size_t input_numel_local = 0;
-    if (!SafeMulSize(static_cast<size_t>(*mapped_rows), static_cast<size_t>(*mapped_cols), &logical_numel_local) ||
-        !SafeMulSize(static_cast<size_t>(*padded_rows), static_cast<size_t>(*padded_cols), &input_numel_local)) {
-        *error = "numel_overflow";
-        return false;
-    }
-
-    size_t full_numel = 0;
-    size_t full_numel_tmp = 0;
-    if (!SafeMulSize(static_cast<size_t>(t), static_cast<size_t>(h), &full_numel_tmp) ||
-        !SafeMulSize(full_numel_tmp, static_cast<size_t>(d), &full_numel)) {
-        *error = "full_numel_overflow";
-        return false;
-    }
-
-    const size_t expected_fp16_bytes = full_numel * sizeof(uint16_t);
-    if (info.data_bytes != expected_fp16_bytes) {
-        std::ostringstream oss;
-        oss << "npy_data_bytes_mismatch(expected=" << expected_fp16_bytes
-            << ",got=" << info.data_bytes << ")";
-        *error = oss.str();
-        return false;
-    }
-
-    out->assign(input_numel_local, __float2bfloat16(0.0f));
-
-    const uint16_t* fp16_bits = reinterpret_cast<const uint16_t*>(raw.data() + info.data_offset);
-    const size_t seq_row_base = static_cast<size_t>(seq_begin) * static_cast<size_t>(h);
-
-    const int local_mapped_rows = *mapped_rows;
-    const int local_mapped_cols = *mapped_cols;
-    const int local_padded_cols = *padded_cols;
-    __nv_bfloat16* out_data = out->data();
-
-    const std::chrono::high_resolution_clock::time_point begin = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for schedule(static)
-    for (int r = 0; r < local_mapped_rows; ++r) {
-        const size_t global_row = seq_row_base + static_cast<size_t>(r);
-        const uint16_t* src_row = fp16_bits + global_row * static_cast<size_t>(local_mapped_cols);
-        __nv_bfloat16* dst_row = out_data + static_cast<size_t>(r) * static_cast<size_t>(local_padded_cols);
-        for (int c = 0; c < local_mapped_cols; ++c) {
-            __half_raw hr;
-            hr.x = src_row[c];
-            const __half hval = hr;
-            dst_row[c] = __float2bfloat16(__half2float(hval));
-        }
-    }
-    const std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
-
-    *convert_ms = std::chrono::duration<double, std::milli>(end - begin).count();
-    *logical_numel = logical_numel_local;
-    *input_numel = input_numel_local;
-    return true;
-}
-
 // Fused FP16->BF16 conversion + exponent analysis in a single SIMD-accelerated pass.
-// Combines ConvertHeadSplitPadFp16ToBf16 + analyzeExponentDistribution_BF16 into one
-// data pass, and returns the exponent histogram for CollectExponentCoverageFromHistogram.
+// Returns the exponent histogram for CollectExponentCoverageFromHistogram.
 bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
                                    const std::vector<uint8_t>& raw,
                                    int64_t seq_begin,
@@ -1111,96 +925,6 @@ bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
         for (int i = 0; i < top_n; i++) top_exponents[i] = best_start + i;
     }
 
-    return true;
-}
-
-void FreeCompressedBuffers(CompressedBuffers* buffers) {
-    free(buffers->sign_mantissa);
-    free(buffers->compressed_full);
-    free(buffers->bitmap1);
-    free(buffers->bitmap2);
-    free(buffers->bitmap3);
-    free(buffers->tile_offsets);
-    free(buffers->tile_offsets_median);
-    free(buffers->tile_offsets_global);
-
-    buffers->sign_mantissa = nullptr;
-    buffers->compressed_full = nullptr;
-    buffers->bitmap1 = nullptr;
-    buffers->bitmap2 = nullptr;
-    buffers->bitmap3 = nullptr;
-    buffers->tile_offsets = nullptr;
-    buffers->tile_offsets_median = nullptr;
-    buffers->tile_offsets_global = nullptr;
-    buffers->num_global_tiles = 0;
-    buffers->max_high_freq_count = 0;
-    buffers->max_full_count = 0;
-    buffers->high_freq_count = 0;
-    buffers->full_count = 0;
-    buffers->start_exp = 0;
-    buffers->comp_bytes = 0;
-}
-
-bool RunCompressionOnce(__nv_bfloat16* matrix,
-                        int rows,
-                        int cols,
-                        const int* top_exponents,
-                        CompressedBuffers* out,
-                        std::string* error) {
-    FreeCompressedBuffers(out);
-
-    const int tile_m = 8;
-    const int tile_m_median = 16;
-    const int tile_m_global = 64;
-    const int tile_k = 8;
-    const int tile_k_median = 64;
-    const int tile_k_global = 64;
-
-    int max_high_freq_count = 0;
-    int max_full_count = 0;
-    const int num_global_tiles = InitBF16MatrixTripleBitmap(
-        matrix,
-        rows,
-        cols,
-        tile_m,
-        tile_m_median,
-        tile_m_global,
-        tile_k,
-        tile_k_median,
-        tile_k_global,
-        top_exponents,
-        &out->sign_mantissa,
-        &out->compressed_full,
-        &out->bitmap1,
-        &out->bitmap2,
-        &out->bitmap3,
-        &out->tile_offsets,
-        &out->tile_offsets_median,
-        &out->tile_offsets_global,
-        max_high_freq_count,
-        max_full_count);
-
-    if (num_global_tiles <= 0) {
-        *error = "InitBF16MatrixTripleBitmap failed";
-        FreeCompressedBuffers(out);
-        return false;
-    }
-
-    out->num_global_tiles = num_global_tiles;
-    out->max_high_freq_count = max_high_freq_count;
-    out->max_full_count = max_full_count;
-    out->start_exp = static_cast<uint8_t>(top_exponents[0] - 1);
-    out->high_freq_count = out->tile_offsets_global[num_global_tiles * 2];
-    out->full_count = out->tile_offsets_global[num_global_tiles * 2 + 1];
-
-    const int num_tiles = (rows / tile_m) * (cols / tile_k);
-    const int num_median_tiles = (rows / tile_m_median) * (cols / tile_k_median);
-
-    out->comp_bytes = static_cast<size_t>(out->high_freq_count) * sizeof(uint8_t) +
-                      static_cast<size_t>(out->full_count) * sizeof(__nv_bfloat16) +
-                      static_cast<size_t>(num_tiles) * sizeof(uint64_t) * 3 +
-                      static_cast<size_t>(num_median_tiles) * 2 * sizeof(int) +
-                      static_cast<size_t>(num_global_tiles + 1) * 2 * sizeof(int);
     return true;
 }
 
@@ -1675,10 +1399,6 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path,
         row.file_path = file_path;
         row.file_name = file_name;
         row.tensor_id = parsed_tensor_id;
-        if (row.tensor_id >= 0) {
-            row.pair_index = row.tensor_id / 2;
-            row.pair_slot = row.tensor_id % 2;
-        }
         row.tensor_label = tensor_base_label + "-" + std::to_string(sub_id);
         return row;
     };
@@ -1800,80 +1520,94 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path,
     std::vector<bool> chunk_failed(static_cast<size_t>(num_chunks), false);
 
     if (alloc_ok && max_padded_rows > 0) {
-        // 2a) Parallel preprocessing: fused SIMD convert + analyze + coverage (single data pass)
-        const auto preprocess_wall_begin = std::chrono::high_resolution_clock::now();
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int64_t idx = 0; idx < num_chunks; ++idx) {
-            ChunkWork& work = work_items[static_cast<size_t>(idx)];
-            BenchRow& row = work.row;
-
-            const int64_t seq_begin = idx * chunk_len;
-            const int64_t seq_count = (idx == num_chunks - 1) ? (t - seq_begin) : chunk_len;
-
-            int mapped_rows = 0;
-            int mapped_cols = 0;
-            int padded_rows = 0;
-            int padded_cols = 0;
-            int exponent_counts[256];
-            std::string local_error;
-
-            if (!ConvertFp16ToBf16WithAnalysis(info,
-                                               raw,
-                                               seq_begin,
-                                               seq_count,
-                                               &work.host_bf16,
-                                               &mapped_rows,
-                                               &mapped_cols,
-                                               &padded_rows,
-                                               &padded_cols,
-                                               &row.logical_numel,
-                                               &row.input_numel,
-                                               &row.convert_ms,
-                                               work.top_exponents.data(),
-                                               exponent_counts,
-                                               &local_error)) {
-                row.status = (local_error == "non_3d_shape") ? "skipped" : "failed";
-                row.note = local_error;
-                continue;
+        // 2a) Parallel preprocessing: warmup + timed iterations
+        //     First opts.warmup runs warm up caches; remaining opts.iters runs are timed.
+        double total_preprocess_wall_ms = 0.0;
+        const int preprocess_total_runs = opts.warmup + opts.iters;
+        for (int preprocess_run = 0; preprocess_run < preprocess_total_runs; ++preprocess_run) {
+            const bool is_timed = (preprocess_run >= opts.warmup);
+            std::chrono::high_resolution_clock::time_point preprocess_wall_begin;
+            if (is_timed) {
+                preprocess_wall_begin = std::chrono::high_resolution_clock::now();
             }
 
-            row.mapped_shape = "[" + std::to_string(mapped_rows) + "," + std::to_string(mapped_cols) + "]";
-            row.padded_shape = "[" + std::to_string(padded_rows) + "," + std::to_string(padded_cols) + "]";
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int64_t idx = 0; idx < num_chunks; ++idx) {
+                ChunkWork& work = work_items[static_cast<size_t>(idx)];
+                BenchRow& row = work.row;
 
-            row.logical_bytes = row.logical_numel * sizeof(__nv_bfloat16);
-            row.input_bytes = row.input_numel * sizeof(__nv_bfloat16);
-            row.pad_elems = row.input_numel - row.logical_numel;
-            row.pad_ratio = (row.logical_numel > 0)
-                                ? static_cast<double>(row.pad_elems) / static_cast<double>(row.logical_numel)
-                                : 0.0;
+                const int64_t seq_begin = idx * chunk_len;
+                const int64_t seq_count = (idx == num_chunks - 1) ? (t - seq_begin) : chunk_len;
 
-            if (padded_rows % 64 != 0 || padded_cols % 64 != 0) {
-                row.status = "failed";
-                row.note = "internal_error_padded_shape_not_multiple_of_64";
-                continue;
+                int mapped_rows = 0;
+                int mapped_cols = 0;
+                int padded_rows = 0;
+                int padded_cols = 0;
+                int exponent_counts[256];
+                std::string local_error;
+
+                if (!ConvertFp16ToBf16WithAnalysis(info,
+                                                   raw,
+                                                   seq_begin,
+                                                   seq_count,
+                                                   &work.host_bf16,
+                                                   &mapped_rows,
+                                                   &mapped_cols,
+                                                   &padded_rows,
+                                                   &padded_cols,
+                                                   &row.logical_numel,
+                                                   &row.input_numel,
+                                                   &row.convert_ms,
+                                                   work.top_exponents.data(),
+                                                   exponent_counts,
+                                                   &local_error)) {
+                    row.status = (local_error == "non_3d_shape") ? "skipped" : "failed";
+                    row.note = local_error;
+                    continue;
+                }
+
+                row.mapped_shape = "[" + std::to_string(mapped_rows) + "," + std::to_string(mapped_cols) + "]";
+                row.padded_shape = "[" + std::to_string(padded_rows) + "," + std::to_string(padded_cols) + "]";
+
+                row.logical_bytes = row.logical_numel * sizeof(__nv_bfloat16);
+                row.input_bytes = row.input_numel * sizeof(__nv_bfloat16);
+                row.pad_elems = row.input_numel - row.logical_numel;
+                row.pad_ratio = (row.logical_numel > 0)
+                                    ? static_cast<double>(row.pad_elems) / static_cast<double>(row.logical_numel)
+                                    : 0.0;
+
+                if (padded_rows % 64 != 0 || padded_cols % 64 != 0) {
+                    row.status = "failed";
+                    row.note = "internal_error_padded_shape_not_multiple_of_64";
+                    continue;
+                }
+
+                const std::array<int, 7> selected_exponents = {
+                    work.top_exponents[0], work.top_exponents[1], work.top_exponents[2], work.top_exponents[3],
+                    work.top_exponents[4], work.top_exponents[5], work.top_exponents[6]
+                };
+                std::array<int, 7> raw_top_exponents;
+                CollectExponentCoverageFromHistogram(exponent_counts,
+                                                     static_cast<size_t>(padded_rows) * static_cast<size_t>(padded_cols),
+                                                     selected_exponents,
+                                                     &raw_top_exponents,
+                                                     &row.top7_raw_cover,
+                                                     &row.top7_selected_cover);
+
+                row.top7_raw = FormatExponentList(raw_top_exponents);
+                row.top7_selected = FormatExponentList(selected_exponents);
+
+                work.padded_rows = padded_rows;
+                work.padded_cols = padded_cols;
+                work.preprocess_ok = true;
             }
 
-            const std::array<int, 7> selected_exponents = {
-                work.top_exponents[0], work.top_exponents[1], work.top_exponents[2], work.top_exponents[3],
-                work.top_exponents[4], work.top_exponents[5], work.top_exponents[6]
-            };
-            std::array<int, 7> raw_top_exponents;
-            CollectExponentCoverageFromHistogram(exponent_counts,
-                                                 static_cast<size_t>(padded_rows) * static_cast<size_t>(padded_cols),
-                                                 selected_exponents,
-                                                 &raw_top_exponents,
-                                                 &row.top7_raw_cover,
-                                                 &row.top7_selected_cover);
-
-            row.top7_raw = FormatExponentList(raw_top_exponents);
-            row.top7_selected = FormatExponentList(selected_exponents);
-
-            work.padded_rows = padded_rows;
-            work.padded_cols = padded_cols;
-            work.preprocess_ok = true;
+            if (is_timed) {
+                const auto preprocess_wall_end = std::chrono::high_resolution_clock::now();
+                total_preprocess_wall_ms += std::chrono::duration<double, std::milli>(preprocess_wall_end - preprocess_wall_begin).count();
+            }
         }
-        const auto preprocess_wall_end = std::chrono::high_resolution_clock::now();
-        file_analyze_wall_ms = std::chrono::duration<double, std::milli>(preprocess_wall_end - preprocess_wall_begin).count();
+        file_analyze_wall_ms = total_preprocess_wall_ms / static_cast<double>(opts.iters);
 
         // 2b) Warmup: parallel over chunks
         #pragma omp parallel for schedule(dynamic, 1)
@@ -2134,16 +1868,6 @@ std::string FormatDouble(double x, int precision = 4) {
 
 std::string FormatTop7WithCover(const std::string& top7, double cover_ratio) {
     return top7 + " (" + FormatDouble(cover_ratio * 100.0, 1) + "%)";
-}
-
-std::string Truncate(const std::string& s, size_t max_len) {
-    if (s.size() <= max_len) {
-        return s;
-    }
-    if (max_len <= 3) {
-        return s.substr(0, max_len);
-    }
-    return s.substr(0, max_len - 3) + "...";
 }
 
 void PrintRowHeader() {
