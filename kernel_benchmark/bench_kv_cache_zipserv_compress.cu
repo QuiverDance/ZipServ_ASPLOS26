@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include <omp.h>
+#include <immintrin.h>
 
 #include "L_API.cuh"
 #include "bench_manifest_utils.h"
@@ -71,6 +72,32 @@ struct CompressedBuffers {
     int full_count = 0;
     uint8_t start_exp = 0;
     size_t comp_bytes = 0;
+};
+
+// Pre-allocated workspace for buffer-reuse compression (zero malloc/free per call)
+struct CompressReusableBuffers {
+    // Output buffers (allocated at max possible size)
+    uint8_t* sign_mantissa = nullptr;
+    __nv_bfloat16* compressed_full = nullptr;
+    uint64_t* bitmap1 = nullptr;
+    uint64_t* bitmap2 = nullptr;
+    uint64_t* bitmap3 = nullptr;
+    int* tile_offsets = nullptr;
+    int* tile_offsets_median = nullptr;
+    int* tile_offsets_global = nullptr;
+
+    // Temp workspace
+    uint8_t* temp_sm = nullptr;
+    __nv_bfloat16* temp_full = nullptr;
+    int* gt_hf_count = nullptr;
+    int* gt_full_count = nullptr;
+    int* hf_offsets = nullptr;
+    int* full_offsets = nullptr;
+
+    // Dimensions used for allocation
+    int alloc_rows = 0;
+    int alloc_cols = 0;
+    int num_global_tiles = 0;
 };
 
 struct DeviceCompressedBuffers {
@@ -723,6 +750,54 @@ void CollectExponentCoverage(const std::vector<__nv_bfloat16>& matrix,
                           : 0.0;
 }
 
+// Lightweight coverage using pre-built histogram (avoids re-scanning data)
+void CollectExponentCoverageFromHistogram(
+    const int* exponent_counts,
+    size_t total_elements,
+    const std::array<int, 7>& selected_exponents,
+    std::array<int, 7>* raw_top_exponents,
+    double* raw_cover,
+    double* selected_cover) {
+    std::vector<std::pair<int, int>> sorted;
+    sorted.reserve(256);
+    for (int e = 0; e < 256; ++e) {
+        if (exponent_counts[e] > 0) {
+            sorted.push_back(std::make_pair(e, exponent_counts[e]));
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                  if (a.second != b.second) return a.second > b.second;
+                  return a.first < b.first;
+              });
+
+    raw_top_exponents->fill(-1);
+    for (size_t i = 0; i < raw_top_exponents->size() && i < sorted.size(); ++i) {
+        (*raw_top_exponents)[i] = sorted[i].first;
+    }
+
+    bool raw_mask[256] = {false};
+    bool selected_mask[256] = {false};
+    for (size_t i = 0; i < 7; ++i) {
+        if ((*raw_top_exponents)[i] >= 0) raw_mask[(*raw_top_exponents)[i]] = true;
+        if (selected_exponents[i] >= 0 && selected_exponents[i] < 256)
+            selected_mask[selected_exponents[i]] = true;
+    }
+
+    size_t raw_count = 0, sel_count = 0;
+    for (int e = 0; e < 256; ++e) {
+        if (raw_mask[e]) raw_count += static_cast<size_t>(exponent_counts[e]);
+        if (selected_mask[e]) sel_count += static_cast<size_t>(exponent_counts[e]);
+    }
+
+    *raw_cover = (total_elements > 0)
+                     ? static_cast<double>(raw_count) / static_cast<double>(total_elements)
+                     : 0.0;
+    *selected_cover = (total_elements > 0)
+                          ? static_cast<double>(sel_count) / static_cast<double>(total_elements)
+                          : 0.0;
+}
+
 bool ConvertHeadSplitPadFp16ToBf16(const NpyInfo& info,
                                    const std::vector<uint8_t>& raw,
                                    int64_t seq_begin,
@@ -826,6 +901,219 @@ bool ConvertHeadSplitPadFp16ToBf16(const NpyInfo& info,
     return true;
 }
 
+// Fused FP16->BF16 conversion + exponent analysis in a single SIMD-accelerated pass.
+// Combines ConvertHeadSplitPadFp16ToBf16 + analyzeExponentDistribution_BF16 into one
+// data pass, and returns the exponent histogram for CollectExponentCoverageFromHistogram.
+bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
+                                   const std::vector<uint8_t>& raw,
+                                   int64_t seq_begin,
+                                   int64_t seq_count,
+                                   std::vector<__nv_bfloat16>* out,
+                                   int* mapped_rows_out,
+                                   int* mapped_cols_out,
+                                   int* padded_rows_out,
+                                   int* padded_cols_out,
+                                   size_t* logical_numel,
+                                   size_t* input_numel,
+                                   double* convert_ms,
+                                   int* top_exponents,
+                                   int* exponent_counts_out,
+                                   std::string* error) {
+    if (info.shape.size() != 3) {
+        *error = "non_3d_shape";
+        return false;
+    }
+
+    const int64_t t = info.shape[0];
+    const int64_t h = info.shape[1];
+    const int64_t d = info.shape[2];
+    if (t <= 0 || h <= 0 || d <= 0) {
+        *error = "shape_has_non_positive_dimension";
+        return false;
+    }
+    if (h > std::numeric_limits<int>::max() || d > std::numeric_limits<int>::max()) {
+        *error = "shape_dimension_too_large";
+        return false;
+    }
+    if (seq_begin < 0 || seq_count <= 0 || seq_begin + seq_count > t) {
+        *error = "invalid_seq_chunk_range";
+        return false;
+    }
+
+    const int64_t rows64 = seq_count * h;
+    if (rows64 > std::numeric_limits<int>::max()) {
+        *error = "mapped_rows_overflow";
+        return false;
+    }
+
+    const int mapped_rows = static_cast<int>(rows64);
+    const int mapped_cols = static_cast<int>(d);
+    *mapped_rows_out = mapped_rows;
+    *mapped_cols_out = mapped_cols;
+    *padded_rows_out = RoundUpTo64(mapped_rows);
+    *padded_cols_out = RoundUpTo64(mapped_cols);
+    const int padded_rows = *padded_rows_out;
+    const int padded_cols = *padded_cols_out;
+
+    size_t logical_numel_local = 0;
+    size_t input_numel_local = 0;
+    if (!SafeMulSize(static_cast<size_t>(mapped_rows), static_cast<size_t>(mapped_cols), &logical_numel_local) ||
+        !SafeMulSize(static_cast<size_t>(padded_rows), static_cast<size_t>(padded_cols), &input_numel_local)) {
+        *error = "numel_overflow";
+        return false;
+    }
+
+    size_t full_numel = 0;
+    size_t full_numel_tmp = 0;
+    if (!SafeMulSize(static_cast<size_t>(t), static_cast<size_t>(h), &full_numel_tmp) ||
+        !SafeMulSize(full_numel_tmp, static_cast<size_t>(d), &full_numel)) {
+        *error = "full_numel_overflow";
+        return false;
+    }
+
+    const size_t expected_fp16_bytes = full_numel * sizeof(uint16_t);
+    if (info.data_bytes != expected_fp16_bytes) {
+        std::ostringstream oss;
+        oss << "npy_data_bytes_mismatch(expected=" << expected_fp16_bytes
+            << ",got=" << info.data_bytes << ")";
+        *error = oss.str();
+        return false;
+    }
+
+    out->assign(input_numel_local, __float2bfloat16(0.0f));
+
+    const uint16_t* fp16_bits = reinterpret_cast<const uint16_t*>(raw.data() + info.data_offset);
+    const size_t seq_row_base = static_cast<size_t>(seq_begin) * static_cast<size_t>(h);
+    uint16_t* out_data = reinterpret_cast<uint16_t*>(out->data());
+
+    // Zero histogram
+    memset(exponent_counts_out, 0, 256 * sizeof(int));
+
+    const std::chrono::high_resolution_clock::time_point begin = std::chrono::high_resolution_clock::now();
+
+    // SIMD constants
+    const __m256i v_round_bias = _mm256_set1_epi32(0x7FFF);
+    const __m256i v_one_32 = _mm256_set1_epi32(1);
+    const __m128i v_0xFF = _mm_set1_epi16(0xFF);
+    const int simd_width = 8;
+    const int aligned_cols = mapped_cols & ~(simd_width - 1);
+
+    for (int r = 0; r < mapped_rows; ++r) {
+        const size_t global_row = seq_row_base + static_cast<size_t>(r);
+        const uint16_t* src_row = fp16_bits + global_row * static_cast<size_t>(mapped_cols);
+        uint16_t* dst_row = out_data + static_cast<size_t>(r) * static_cast<size_t>(padded_cols);
+
+        int c = 0;
+        // SIMD path: 8 FP16 -> 8 BF16 per iteration using F16C
+        for (; c < aligned_cols; c += simd_width) {
+            // 1) Load 8 x FP16
+            __m128i fp16_8 = _mm_loadu_si128((const __m128i*)(src_row + c));
+            // 2) FP16 -> FP32 via F16C
+            __m256 fp32_8 = _mm256_cvtph_ps(fp16_8);
+            __m256i fp32_bits = _mm256_castps_si256(fp32_8);
+            // 3) FP32 -> BF16 with round-to-nearest-even
+            __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(fp32_bits, 16), v_one_32);
+            __m256i rounded = _mm256_add_epi32(fp32_bits, _mm256_add_epi32(v_round_bias, lsb));
+            __m256i bf16_32 = _mm256_srli_epi32(rounded, 16);
+            // 4) Pack 8 x 32-bit -> 8 x 16-bit
+            __m256i packed = _mm256_packus_epi32(bf16_32, _mm256_setzero_si256());
+            __m128i lo = _mm256_castsi256_si128(packed);
+            __m128i hi = _mm256_extracti128_si256(packed, 1);
+            __m128i bf16_8 = _mm_unpacklo_epi64(lo, hi);
+            // 5) Store 8 BF16
+            _mm_storeu_si128((__m128i*)(dst_row + c), bf16_8);
+            // 6) Extract exponents and update histogram
+            __m128i exp_8 = _mm_and_si128(_mm_srli_epi16(bf16_8, 7), v_0xFF);
+            uint16_t exp_arr[8];
+            _mm_storeu_si128((__m128i*)exp_arr, exp_8);
+            exponent_counts_out[exp_arr[0]]++;
+            exponent_counts_out[exp_arr[1]]++;
+            exponent_counts_out[exp_arr[2]]++;
+            exponent_counts_out[exp_arr[3]]++;
+            exponent_counts_out[exp_arr[4]]++;
+            exponent_counts_out[exp_arr[5]]++;
+            exponent_counts_out[exp_arr[6]]++;
+            exponent_counts_out[exp_arr[7]]++;
+        }
+        // Scalar tail
+        for (; c < mapped_cols; ++c) {
+            __half_raw hr;
+            hr.x = src_row[c];
+            const __half hval = hr;
+            const __nv_bfloat16 bf = __float2bfloat16(__half2float(hval));
+            dst_row[c] = __bfloat16_as_ushort(bf);
+            exponent_counts_out[(dst_row[c] >> 7) & 0xFF]++;
+        }
+    }
+
+    // Account for padding zeros in histogram (BF16 0.0 has exponent 0)
+    const int padding_count = padded_rows * padded_cols - mapped_rows * mapped_cols;
+    exponent_counts_out[0] += padding_count;
+
+    const std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
+    *convert_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+    *logical_numel = logical_numel_local;
+    *input_numel = input_numel_local;
+
+    // Analyze exponent distribution: find top-7 contiguous exponent range
+    const int top_n = 7;
+    int original_top[7];
+    bool used[256] = {false};
+    int n_found = 0;
+    for (int ti = 0; ti < top_n; ++ti) {
+        int best_exp = -1;
+        int best_count = 0;
+        for (int e = 0; e < 256; ++e) {
+            if (!used[e] && exponent_counts_out[e] > best_count) {
+                best_count = exponent_counts_out[e];
+                best_exp = e;
+            }
+        }
+        if (best_exp >= 0) {
+            original_top[n_found++] = best_exp;
+            used[best_exp] = true;
+        }
+    }
+    while (n_found < top_n) {
+        original_top[n_found] = 127 - n_found;
+        n_found++;
+    }
+    std::sort(original_top, original_top + top_n);
+
+    bool found_continuous = false;
+    for (int ci = 0; ci < top_n; ++ci) {
+        const int start = original_top[ci];
+        if (start < 0 || start + top_n - 1 > 255) continue;
+        bool all_exist = true;
+        for (int i = 0; i < top_n; ++i) {
+            if (exponent_counts_out[start + i] <= 0) { all_exist = false; break; }
+        }
+        if (!all_exist) continue;
+        for (int i = 0; i < top_n; ++i) top_exponents[i] = start + i;
+        found_continuous = true;
+        break;
+    }
+    if (!found_continuous) {
+        int best_start = original_top[0];
+        int max_length = 1;
+        int current_length = 1;
+        for (int i = 1; i < top_n; i++) {
+            if (original_top[i] == original_top[i-1] + 1) {
+                current_length++;
+                if (current_length > max_length) {
+                    max_length = current_length;
+                    best_start = original_top[i] - current_length + 1;
+                }
+            } else {
+                current_length = 1;
+            }
+        }
+        for (int i = 0; i < top_n; i++) top_exponents[i] = best_start + i;
+    }
+
+    return true;
+}
+
 void FreeCompressedBuffers(CompressedBuffers* buffers) {
     free(buffers->sign_mantissa);
     free(buffers->compressed_full);
@@ -904,6 +1192,127 @@ bool RunCompressionOnce(__nv_bfloat16* matrix,
     out->start_exp = static_cast<uint8_t>(top_exponents[0] - 1);
     out->high_freq_count = out->tile_offsets_global[num_global_tiles * 2];
     out->full_count = out->tile_offsets_global[num_global_tiles * 2 + 1];
+
+    const int num_tiles = (rows / tile_m) * (cols / tile_k);
+    const int num_median_tiles = (rows / tile_m_median) * (cols / tile_k_median);
+
+    out->comp_bytes = static_cast<size_t>(out->high_freq_count) * sizeof(uint8_t) +
+                      static_cast<size_t>(out->full_count) * sizeof(__nv_bfloat16) +
+                      static_cast<size_t>(num_tiles) * sizeof(uint64_t) * 3 +
+                      static_cast<size_t>(num_median_tiles) * 2 * sizeof(int) +
+                      static_cast<size_t>(num_global_tiles + 1) * 2 * sizeof(int);
+    return true;
+}
+
+bool AllocReusableBuffers(int padded_rows, int padded_cols, CompressReusableBuffers* rb) {
+    const int tile_m = 8, tile_m_median = 16, tile_m_global = 64;
+    const int tile_k = 8, tile_k_median = 64, tile_k_global = 64;
+
+    const int num_tiles = (padded_rows / tile_m) * (padded_cols / tile_k);
+    const int num_median_tiles = (padded_rows / tile_m_median) * (padded_cols / tile_k_median);
+    const int num_global_tiles = (padded_rows / tile_m_global) * (padded_cols / tile_k_global);
+    const size_t max_elems = (size_t)padded_rows * padded_cols;
+    const int max_elem_per_gtile = tile_m_global * tile_k_global;
+    const int max_sm_per_gtile = max_elem_per_gtile + 15;
+    const int max_full_per_gtile = max_elem_per_gtile + 7;
+
+    // Output buffers (max possible size)
+    rb->sign_mantissa = (uint8_t*)malloc(max_elems > 0 ? max_elems : 1);
+    rb->compressed_full = (__nv_bfloat16*)malloc((max_elems > 0 ? max_elems : 1) * sizeof(__nv_bfloat16));
+    rb->bitmap1 = (uint64_t*)malloc(num_tiles * sizeof(uint64_t));
+    rb->bitmap2 = (uint64_t*)malloc(num_tiles * sizeof(uint64_t));
+    rb->bitmap3 = (uint64_t*)malloc(num_tiles * sizeof(uint64_t));
+    rb->tile_offsets = (int*)malloc(num_tiles * 2 * sizeof(int));
+    rb->tile_offsets_median = (int*)malloc(num_median_tiles * 2 * sizeof(int));
+    rb->tile_offsets_global = (int*)malloc((num_global_tiles + 1) * 2 * sizeof(int));
+
+    // Temp workspace
+    rb->temp_sm = (uint8_t*)malloc((size_t)num_global_tiles * max_sm_per_gtile);
+    rb->temp_full = (__nv_bfloat16*)malloc((size_t)num_global_tiles * max_full_per_gtile * sizeof(__nv_bfloat16));
+    rb->gt_hf_count = (int*)malloc(num_global_tiles * sizeof(int));
+    rb->gt_full_count = (int*)malloc(num_global_tiles * sizeof(int));
+    rb->hf_offsets = (int*)malloc((num_global_tiles + 1) * sizeof(int));
+    rb->full_offsets = (int*)malloc((num_global_tiles + 1) * sizeof(int));
+
+    rb->alloc_rows = padded_rows;
+    rb->alloc_cols = padded_cols;
+    rb->num_global_tiles = num_global_tiles;
+
+    return rb->sign_mantissa && rb->compressed_full &&
+           rb->bitmap1 && rb->bitmap2 && rb->bitmap3 &&
+           rb->tile_offsets && rb->tile_offsets_median && rb->tile_offsets_global &&
+           rb->temp_sm && rb->temp_full &&
+           rb->gt_hf_count && rb->gt_full_count &&
+           rb->hf_offsets && rb->full_offsets;
+}
+
+void FreeReusableBuffers(CompressReusableBuffers* rb) {
+    free(rb->sign_mantissa);
+    free(rb->compressed_full);
+    free(rb->bitmap1);
+    free(rb->bitmap2);
+    free(rb->bitmap3);
+    free(rb->tile_offsets);
+    free(rb->tile_offsets_median);
+    free(rb->tile_offsets_global);
+    free(rb->temp_sm);
+    free(rb->temp_full);
+    free(rb->gt_hf_count);
+    free(rb->gt_full_count);
+    free(rb->hf_offsets);
+    free(rb->full_offsets);
+    *rb = CompressReusableBuffers();
+}
+
+bool RunCompressionReuse(__nv_bfloat16* matrix,
+                         int rows,
+                         int cols,
+                         const int* top_exponents,
+                         CompressReusableBuffers* rb,
+                         CompressedBuffers* out,
+                         std::string* error) {
+    const int tile_m = 8, tile_m_median = 16, tile_m_global = 64;
+    const int tile_k = 8, tile_k_median = 64, tile_k_global = 64;
+
+    int max_high_freq_count = 0;
+    int max_full_count = 0;
+    int total_hf = 0;
+    int total_full = 0;
+
+    const int num_global_tiles = InitBF16MatrixTripleBitmap_Reuse_SIMD(
+        matrix, rows, cols,
+        tile_m, tile_m_median, tile_m_global,
+        tile_k, tile_k_median, tile_k_global,
+        top_exponents,
+        rb->sign_mantissa, rb->compressed_full,
+        rb->bitmap1, rb->bitmap2, rb->bitmap3,
+        rb->tile_offsets, rb->tile_offsets_median, rb->tile_offsets_global,
+        rb->temp_sm, rb->temp_full,
+        rb->gt_hf_count, rb->gt_full_count,
+        rb->hf_offsets, rb->full_offsets,
+        max_high_freq_count, max_full_count,
+        total_hf, total_full);
+
+    if (num_global_tiles <= 0) {
+        *error = "InitBF16MatrixTripleBitmap_Reuse failed";
+        return false;
+    }
+
+    out->sign_mantissa = rb->sign_mantissa;
+    out->compressed_full = rb->compressed_full;
+    out->bitmap1 = rb->bitmap1;
+    out->bitmap2 = rb->bitmap2;
+    out->bitmap3 = rb->bitmap3;
+    out->tile_offsets = rb->tile_offsets;
+    out->tile_offsets_median = rb->tile_offsets_median;
+    out->tile_offsets_global = rb->tile_offsets_global;
+
+    out->num_global_tiles = num_global_tiles;
+    out->max_high_freq_count = max_high_freq_count;
+    out->max_full_count = max_full_count;
+    out->start_exp = static_cast<uint8_t>(top_exponents[0] - 1);
+    out->high_freq_count = total_hf;
+    out->full_count = total_full;
 
     const int num_tiles = (rows / tile_m) * (cols / tile_k);
     const int num_median_tiles = (rows / tile_m_median) * (cols / tile_k_median);
@@ -1244,8 +1653,19 @@ std::string BuildTensorBaseLabel(const std::string& file_name) {
     return file_name;
 }
 
-std::vector<BenchRow> ProcessFile(const std::string& file_path, const ProgramOptions& opts) {
+std::vector<BenchRow> ProcessFile(const std::string& file_path,
+                                  const ProgramOptions& opts,
+                                  double* compress_wall_ms_out,
+                                  double* service_wall_ms_out) {
     std::vector<BenchRow> rows;
+    double file_compress_wall_ms = 0.0;
+    double file_analyze_wall_ms = 0.0;
+    if (compress_wall_ms_out != nullptr) {
+        *compress_wall_ms_out = 0.0;
+    }
+    if (service_wall_ms_out != nullptr) {
+        *service_wall_ms_out = 0.0;
+    }
     const std::string file_name = Basename(file_path);
     const int parsed_tensor_id = ParseTensorIdFromName(file_name);
     const std::string tensor_base_label = BuildTensorBaseLabel(file_name);
@@ -1316,164 +1736,287 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path, const ProgramOpt
 
     const int64_t chunk_len = 16;
     const int64_t num_chunks = (t + chunk_len - 1) / chunk_len;
-    rows.reserve(static_cast<size_t>(num_chunks));
+    struct ChunkWork {
+        BenchRow row;
+        std::vector<__nv_bfloat16> host_bf16;
+        std::array<int, 7> top_exponents = {0, 0, 0, 0, 0, 0, 0};
+        int padded_rows = 0;
+        int padded_cols = 0;
+        bool preprocess_ok = false;
+        bool compress_ok = false;
+    };
 
+    std::vector<ChunkWork> work_items(static_cast<size_t>(num_chunks));
+
+    // 1) Lightweight serial init: fill metadata from shape info only (no heavy work)
+    int max_padded_rows = 0, max_padded_cols = 0;
     for (int64_t sub_id = 0; sub_id < num_chunks; ++sub_id) {
-        BenchRow row = MakeBaseRow(static_cast<int>(sub_id));
+        ChunkWork& work = work_items[static_cast<size_t>(sub_id)];
+        BenchRow& row = work.row;
+        row = MakeBaseRow(static_cast<int>(sub_id));
+
         const int64_t seq_begin = sub_id * chunk_len;
         const int64_t seq_count = (sub_id == num_chunks - 1) ? (t - seq_begin) : chunk_len;
         row.shape3d = "[" + std::to_string(seq_count) + "," + std::to_string(h) + "," + std::to_string(d) + "]";
 
-        int mapped_rows = 0;
-        int mapped_cols = 0;
-        int padded_rows = 0;
-        int padded_cols = 0;
+        // Pre-compute padded dimensions from shape alone
+        const int mapped_rows = static_cast<int>(seq_count * h);
+        const int mapped_cols = static_cast<int>(d);
+        work.padded_rows = RoundUpTo64(mapped_rows);
+        work.padded_cols = RoundUpTo64(mapped_cols);
+        max_padded_rows = std::max(max_padded_rows, work.padded_rows);
+        max_padded_cols = std::max(max_padded_cols, work.padded_cols);
+    }
 
-        std::vector<__nv_bfloat16> host_bf16;
-        if (!ConvertHeadSplitPadFp16ToBf16(info,
-                                           raw,
-                                           seq_begin,
-                                           seq_count,
-                                           &host_bf16,
-                                           &mapped_rows,
-                                           &mapped_cols,
-                                           &padded_rows,
-                                           &padded_cols,
-                                           &row.logical_numel,
-                                           &row.input_numel,
-                                           &row.convert_ms,
-                                           &error)) {
-            if (error == "non_3d_shape") {
-                row.status = "skipped";
-            } else {
-                row.status = "failed";
-            }
-            row.note = error;
-            rows.push_back(row);
-            continue;
-        }
+    // 2) Parallel preprocessing + compression benchmark
+    //    Pre-allocate per-thread reusable buffers, then run conversion,
+    //    analysis, and compression in a single parallel region.
 
-        row.mapped_shape = "[" + std::to_string(mapped_rows) + "," + std::to_string(mapped_cols) + "]";
-        row.padded_shape = "[" + std::to_string(padded_rows) + "," + std::to_string(padded_cols) + "]";
-
-        row.logical_bytes = row.logical_numel * sizeof(__nv_bfloat16);
-        row.input_bytes = row.input_numel * sizeof(__nv_bfloat16);
-        row.pad_elems = row.input_numel - row.logical_numel;
-        row.pad_ratio = (row.logical_numel > 0)
-                            ? static_cast<double>(row.pad_elems) / static_cast<double>(row.logical_numel)
-                            : 0.0;
-
-        if (padded_rows % 64 != 0 || padded_cols % 64 != 0) {
-            row.status = "failed";
-            row.note = "internal_error_padded_shape_not_multiple_of_64";
-            rows.push_back(row);
-            continue;
-        }
-
-        int top_exponents[7] = {0};
-        analyzeExponentDistribution_BF16(host_bf16.data(), padded_rows, padded_cols, top_exponents);
-
-        const std::array<int, 7> selected_exponents = {
-            top_exponents[0], top_exponents[1], top_exponents[2], top_exponents[3],
-            top_exponents[4], top_exponents[5], top_exponents[6]
-        };
-        std::array<int, 7> raw_top_exponents;
-        CollectExponentCoverage(host_bf16,
-                                selected_exponents,
-                                &raw_top_exponents,
-                                &row.top7_raw_cover,
-                                &row.top7_selected_cover);
-        row.top7_raw = FormatExponentList(raw_top_exponents);
-        row.top7_selected = FormatExponentList(selected_exponents);
-
-        bool chunk_failed = false;
-        for (int i = 0; i < opts.warmup; ++i) {
-            CompressedBuffers warmup;
-            if (!RunCompressionOnce(host_bf16.data(), padded_rows, padded_cols, top_exponents, &warmup, &error)) {
-                row.status = "failed";
-                row.note = error;
-                FreeCompressedBuffers(&warmup);
-                chunk_failed = true;
+    // Allocate one CompressReusableBuffers per OMP thread
+    const int num_threads = omp_get_max_threads();
+    std::vector<CompressReusableBuffers> thread_bufs(static_cast<size_t>(num_threads));
+    bool alloc_ok = true;
+    if (max_padded_rows > 0 && max_padded_cols > 0) {
+        for (int t = 0; t < num_threads; ++t) {
+            if (!AllocReusableBuffers(max_padded_rows, max_padded_cols, &thread_bufs[static_cast<size_t>(t)])) {
+                alloc_ok = false;
                 break;
             }
-            FreeCompressedBuffers(&warmup);
         }
-        if (chunk_failed) {
-            rows.push_back(row);
-            continue;
+    }
+    if (!alloc_ok) {
+        for (int t = 0; t < num_threads; ++t) {
+            FreeReusableBuffers(&thread_bufs[static_cast<size_t>(t)]);
         }
+        for (int64_t idx = 0; idx < num_chunks; ++idx) {
+            work_items[static_cast<size_t>(idx)].row.status = "failed";
+            work_items[static_cast<size_t>(idx)].row.note = "AllocReusableBuffers failed (per-thread)";
+        }
+    }
 
-        CompressedBuffers final_buffers;
-        double total_compress_ms = 0.0;
-        for (int i = 0; i < opts.iters; ++i) {
-            CompressedBuffers iteration;
-            const std::chrono::high_resolution_clock::time_point begin = std::chrono::high_resolution_clock::now();
-            const bool ok = RunCompressionOnce(host_bf16.data(), padded_rows, padded_cols, top_exponents, &iteration, &error);
-            const std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
+    // Per-chunk accumulators for per-thread timing (for CSV per-chunk compress_ms)
+    std::vector<double> chunk_total_compress_ms(static_cast<size_t>(num_chunks), 0.0);
+    std::vector<size_t> chunk_last_comp_bytes(static_cast<size_t>(num_chunks), 0);
+    std::vector<bool> chunk_failed(static_cast<size_t>(num_chunks), false);
 
-            if (!ok) {
+    if (alloc_ok && max_padded_rows > 0) {
+        // 2a) Parallel preprocessing: fused SIMD convert + analyze + coverage (single data pass)
+        const auto preprocess_wall_begin = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int64_t idx = 0; idx < num_chunks; ++idx) {
+            ChunkWork& work = work_items[static_cast<size_t>(idx)];
+            BenchRow& row = work.row;
+
+            const int64_t seq_begin = idx * chunk_len;
+            const int64_t seq_count = (idx == num_chunks - 1) ? (t - seq_begin) : chunk_len;
+
+            int mapped_rows = 0;
+            int mapped_cols = 0;
+            int padded_rows = 0;
+            int padded_cols = 0;
+            int exponent_counts[256];
+            std::string local_error;
+
+            if (!ConvertFp16ToBf16WithAnalysis(info,
+                                               raw,
+                                               seq_begin,
+                                               seq_count,
+                                               &work.host_bf16,
+                                               &mapped_rows,
+                                               &mapped_cols,
+                                               &padded_rows,
+                                               &padded_cols,
+                                               &row.logical_numel,
+                                               &row.input_numel,
+                                               &row.convert_ms,
+                                               work.top_exponents.data(),
+                                               exponent_counts,
+                                               &local_error)) {
+                row.status = (local_error == "non_3d_shape") ? "skipped" : "failed";
+                row.note = local_error;
+                continue;
+            }
+
+            row.mapped_shape = "[" + std::to_string(mapped_rows) + "," + std::to_string(mapped_cols) + "]";
+            row.padded_shape = "[" + std::to_string(padded_rows) + "," + std::to_string(padded_cols) + "]";
+
+            row.logical_bytes = row.logical_numel * sizeof(__nv_bfloat16);
+            row.input_bytes = row.input_numel * sizeof(__nv_bfloat16);
+            row.pad_elems = row.input_numel - row.logical_numel;
+            row.pad_ratio = (row.logical_numel > 0)
+                                ? static_cast<double>(row.pad_elems) / static_cast<double>(row.logical_numel)
+                                : 0.0;
+
+            if (padded_rows % 64 != 0 || padded_cols % 64 != 0) {
                 row.status = "failed";
-                row.note = error;
-                FreeCompressedBuffers(&iteration);
-                FreeCompressedBuffers(&final_buffers);
-                chunk_failed = true;
-                break;
+                row.note = "internal_error_padded_shape_not_multiple_of_64";
+                continue;
             }
 
-            const double iter_ms = std::chrono::duration<double, std::milli>(end - begin).count();
-            total_compress_ms += iter_ms;
+            const std::array<int, 7> selected_exponents = {
+                work.top_exponents[0], work.top_exponents[1], work.top_exponents[2], work.top_exponents[3],
+                work.top_exponents[4], work.top_exponents[5], work.top_exponents[6]
+            };
+            std::array<int, 7> raw_top_exponents;
+            CollectExponentCoverageFromHistogram(exponent_counts,
+                                                 static_cast<size_t>(padded_rows) * static_cast<size_t>(padded_cols),
+                                                 selected_exponents,
+                                                 &raw_top_exponents,
+                                                 &row.top7_raw_cover,
+                                                 &row.top7_selected_cover);
 
-            if (i == opts.iters - 1) {
-                final_buffers = iteration;
-            } else {
-                FreeCompressedBuffers(&iteration);
+            row.top7_raw = FormatExponentList(raw_top_exponents);
+            row.top7_selected = FormatExponentList(selected_exponents);
+
+            work.padded_rows = padded_rows;
+            work.padded_cols = padded_cols;
+            work.preprocess_ok = true;
+        }
+        const auto preprocess_wall_end = std::chrono::high_resolution_clock::now();
+        file_analyze_wall_ms = std::chrono::duration<double, std::milli>(preprocess_wall_end - preprocess_wall_begin).count();
+
+        // 2b) Warmup: parallel over chunks
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int64_t idx = 0; idx < num_chunks; ++idx) {
+            ChunkWork& work = work_items[static_cast<size_t>(idx)];
+            if (!work.preprocess_ok) continue;
+            const int tid = omp_get_thread_num();
+            CompressReusableBuffers& rb = thread_bufs[static_cast<size_t>(tid)];
+            std::string local_error;
+            for (int i = 0; i < opts.warmup; ++i) {
+                CompressedBuffers warmup;
+                if (!RunCompressionReuse(work.host_bf16.data(),
+                                         work.padded_rows, work.padded_cols,
+                                         work.top_exponents.data(),
+                                         &rb, &warmup, &local_error)) {
+                    work.row.status = "failed";
+                    work.row.note = local_error;
+                    chunk_failed[static_cast<size_t>(idx)] = true;
+                    break;
+                }
             }
         }
 
-        if (chunk_failed) {
-            rows.push_back(row);
-            continue;
+        // 2c) Timed iterations: iter loop OUTSIDE, parallel-for INSIDE
+        //     Wall clock wraps the entire parallel compression per iteration.
+        double total_compress_wall_ms = 0.0;
+        for (int iter = 0; iter < opts.iters; ++iter) {
+            const auto wall_begin = std::chrono::high_resolution_clock::now();
+
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int64_t idx = 0; idx < num_chunks; ++idx) {
+                if (chunk_failed[static_cast<size_t>(idx)]) continue;
+                ChunkWork& work = work_items[static_cast<size_t>(idx)];
+                if (!work.preprocess_ok) continue;
+
+                const int tid = omp_get_thread_num();
+                CompressReusableBuffers& rb = thread_bufs[static_cast<size_t>(tid)];
+                std::string local_error;
+                CompressedBuffers iteration;
+
+                const auto t_begin = std::chrono::high_resolution_clock::now();
+                const bool ok = RunCompressionReuse(work.host_bf16.data(),
+                                                    work.padded_rows, work.padded_cols,
+                                                    work.top_exponents.data(),
+                                                    &rb, &iteration, &local_error);
+                const auto t_end = std::chrono::high_resolution_clock::now();
+
+                if (!ok) {
+                    work.row.status = "failed";
+                    work.row.note = local_error;
+                    chunk_failed[static_cast<size_t>(idx)] = true;
+                } else {
+                    chunk_total_compress_ms[static_cast<size_t>(idx)] +=
+                        std::chrono::duration<double, std::milli>(t_end - t_begin).count();
+                    chunk_last_comp_bytes[static_cast<size_t>(idx)] = iteration.comp_bytes;
+                }
+            }
+
+            const auto wall_end = std::chrono::high_resolution_clock::now();
+            total_compress_wall_ms += std::chrono::duration<double, std::milli>(wall_end - wall_begin).count();
         }
 
-        row.compress_ms = total_compress_ms / static_cast<double>(opts.iters);
-        row.compressed_bytes = final_buffers.comp_bytes;
+        file_compress_wall_ms = total_compress_wall_ms / static_cast<double>(opts.iters);
+    }
 
+    // Free per-thread buffers
+    for (int t = 0; t < num_threads; ++t) {
+        FreeReusableBuffers(&thread_bufs[static_cast<size_t>(t)]);
+    }
+
+    // Fill per-chunk metrics from accumulators
+    for (int64_t idx = 0; idx < num_chunks; ++idx) {
+        ChunkWork& work = work_items[static_cast<size_t>(idx)];
+        if (!work.preprocess_ok || chunk_failed[static_cast<size_t>(idx)]) continue;
+
+        BenchRow& row = work.row;
+        row.compress_ms = chunk_total_compress_ms[static_cast<size_t>(idx)] / static_cast<double>(opts.iters);
+        row.compressed_bytes = chunk_last_comp_bytes[static_cast<size_t>(idx)];
         if (row.compressed_bytes == 0) {
             row.status = "failed";
             row.note = "compressed_bytes_zero";
-            FreeCompressedBuffers(&final_buffers);
-            rows.push_back(row);
             continue;
         }
 
         row.ratio_logical = static_cast<double>(row.compressed_bytes) / static_cast<double>(row.logical_bytes);
         row.ratio_input = static_cast<double>(row.compressed_bytes) / static_cast<double>(row.input_bytes);
         row.compress_gbps_logical = BytesPerSecondToGBps(row.logical_bytes, row.compress_ms);
+        work.compress_ok = true;
+    }
+
+    // 3) Serial decompress/verify to avoid GPU timing interference
+    for (int64_t idx = 0; idx < num_chunks; ++idx) {
+        ChunkWork& work = work_items[static_cast<size_t>(idx)];
+        if (!work.compress_ok) {
+            continue;
+        }
+
+        BenchRow& row = work.row;
+        std::string local_error;
+
+        CompressReusableBuffers reuse_buffers;
+        if (!AllocReusableBuffers(work.padded_rows, work.padded_cols, &reuse_buffers)) {
+            row.status = "failed";
+            row.note = "AllocReusableBuffers failed (decompress stage)";
+            FreeReusableBuffers(&reuse_buffers);
+            continue;
+        }
+
+        CompressedBuffers final_buffers;
+        if (!RunCompressionReuse(work.host_bf16.data(),
+                                 work.padded_rows,
+                                 work.padded_cols,
+                                 work.top_exponents.data(),
+                                 &reuse_buffers,
+                                 &final_buffers,
+                                 &local_error)) {
+            row.status = "failed";
+            row.note = local_error;
+            FreeReusableBuffers(&reuse_buffers);
+            continue;
+        }
 
         std::vector<__nv_bfloat16> verify_output;
         if (!BenchmarkDecompress(final_buffers,
-                                 padded_rows,
-                                 padded_cols,
+                                 work.padded_rows,
+                                 work.padded_cols,
                                  opts,
                                  &row.decompress_ms,
                                  (opts.verify != 0) ? &verify_output : nullptr,
-                                 &error)) {
+                                 &local_error)) {
             row.status = "failed";
-            row.note = error;
-            FreeCompressedBuffers(&final_buffers);
-            rows.push_back(row);
+            row.note = local_error;
+            FreeReusableBuffers(&reuse_buffers);
             continue;
         }
 
         row.decompress_gbps_logical = BytesPerSecondToGBps(row.logical_bytes, row.decompress_ms);
-
         if (opts.verify != 0) {
-            row.verify_mismatch = CountBF16Mismatches(host_bf16, verify_output);
+            row.verify_mismatch = CountBF16Mismatches(work.host_bf16, verify_output);
             if (row.verify_mismatch == std::numeric_limits<size_t>::max()) {
                 row.status = "failed";
                 row.note = "verify_size_mismatch";
-                FreeCompressedBuffers(&final_buffers);
-                rows.push_back(row);
+                FreeReusableBuffers(&reuse_buffers);
                 continue;
             }
             if (row.verify_mismatch > 0) {
@@ -1481,15 +2024,24 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path, const ProgramOpt
                 oss << "verify_mismatch=" << row.verify_mismatch;
                 row.status = "failed";
                 row.note = oss.str();
-                FreeCompressedBuffers(&final_buffers);
-                rows.push_back(row);
+                FreeReusableBuffers(&reuse_buffers);
                 continue;
             }
         }
 
         row.status = "ok";
-        FreeCompressedBuffers(&final_buffers);
-        rows.push_back(row);
+        FreeReusableBuffers(&reuse_buffers);
+    }
+
+    rows.reserve(static_cast<size_t>(num_chunks));
+    for (int64_t sub_id = 0; sub_id < num_chunks; ++sub_id) {
+        rows.push_back(work_items[static_cast<size_t>(sub_id)].row);
+    }
+    if (compress_wall_ms_out != nullptr) {
+        *compress_wall_ms_out = file_compress_wall_ms;
+    }
+    if (service_wall_ms_out != nullptr) {
+        *service_wall_ms_out = file_analyze_wall_ms + file_compress_wall_ms;
     }
     return rows;
 }
@@ -1761,9 +2313,14 @@ int main(int argc, char** argv) {
 
     std::vector<BenchRow> rows;
     rows.reserve(files.size() * 8);
-
+    double total_compress_wall_ms = 0.0;
+    double total_service_wall_ms = 0.0;
     for (size_t i = 0; i < files.size(); ++i) {
-        const std::vector<BenchRow> file_rows = ProcessFile(files[i], opts);
+        double file_compress_wall_ms = 0.0;
+        double file_service_wall_ms = 0.0;
+        const std::vector<BenchRow> file_rows = ProcessFile(files[i], opts, &file_compress_wall_ms, &file_service_wall_ms);
+        total_compress_wall_ms += file_compress_wall_ms;
+        total_service_wall_ms += file_service_wall_ms;
         for (size_t j = 0; j < file_rows.size(); ++j) {
             const BenchRow& row = file_rows[j];
             WriteCSVRow(&csv, row);
@@ -1779,6 +2336,38 @@ int main(int argc, char** argv) {
 
     const AggregateSummary agg = BuildAggregate(rows);
     PrintSummary(agg);
+
+    // Compression-only wall-clock metrics
+    if (total_compress_wall_ms > 0.0) {
+        std::cout << "\n--- Compress Wall-Clock ---\n";
+        std::cout << "compress_wall_ms=" << FormatDouble(total_compress_wall_ms, 3);
+        if (agg.ok > 0) {
+            const double compress_wall_chunks_per_ms = static_cast<double>(agg.ok) / total_compress_wall_ms;
+            std::cout << ", compress_wall_chunks_per_ms=" << FormatDouble(compress_wall_chunks_per_ms, 4);
+        }
+        if (agg.total_logical_bytes > 0) {
+            const double compress_wall_gbps_logical = BytesPerSecondToGBps(agg.total_logical_bytes, total_compress_wall_ms);
+            std::cout << ", compress_wall_gbps_logical=" << FormatDouble(compress_wall_gbps_logical, 4);
+        }
+        std::cout << ", omp_threads=" << omp_get_max_threads();
+        std::cout << "\n";
+    }
+
+    // Service wall-clock metrics (analyze + compress; excludes convert/I/O/decompress)
+    if (total_service_wall_ms > 0.0) {
+        std::cout << "\n--- Service Wall-Clock (Analyze+Compress) ---\n";
+        std::cout << "service_wall_ms=" << FormatDouble(total_service_wall_ms, 3);
+        if (agg.ok > 0) {
+            const double service_wall_chunks_per_ms = static_cast<double>(agg.ok) / total_service_wall_ms;
+            std::cout << ", service_wall_chunks_per_ms=" << FormatDouble(service_wall_chunks_per_ms, 4);
+        }
+        if (agg.total_logical_bytes > 0) {
+            const double service_wall_gbps_logical = BytesPerSecondToGBps(agg.total_logical_bytes, total_service_wall_ms);
+            std::cout << ", service_wall_gbps_logical=" << FormatDouble(service_wall_gbps_logical, 4);
+        }
+        std::cout << ", omp_threads=" << omp_get_max_threads();
+        std::cout << "\n";
+    }
 
     std::cout << "CSV written to: " << opts.out_csv << "\n";
 
