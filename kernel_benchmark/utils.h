@@ -187,94 +187,74 @@ double ComputeTotalError_BF16(const __nv_bfloat16* A, const __nv_bfloat16* B, in
 
 // Analyze exponent distribution of BF16 matrix
 void analyzeExponentDistribution_BF16(__nv_bfloat16* matrix, int M, int K, int* top_exponents, int top_n = 7) {
-    // Count exponent distribution using fixed-size array (O(1) access vs std::map O(log n))
+    // Count exponent distribution — single-threaded for typical KV-cache chunks
+    // (16K-131K elements). OMP fork-join overhead exceeds parallelism benefit.
     int exponent_counts_arr[256] = {0};
     const int total_elements = M * K;
 
-    #pragma omp parallel
-    {
-        int local_counts[256] = {0};
-        #pragma omp for nowait schedule(static)
-        for (int i = 0; i < total_elements; i++) {
-            uint16_t bits = __bfloat16_as_ushort(matrix[i]);
-            uint8_t exponent = (bits >> 7) & 0xFF;
-            local_counts[exponent]++;
-        }
-        #pragma omp critical
-        {
-            for (int e = 0; e < 256; ++e) {
-                exponent_counts_arr[e] += local_counts[e];
+    for (int i = 0; i < total_elements; i++) {
+        const uint16_t bits = __bfloat16_as_ushort(matrix[i]);
+        exponent_counts_arr[(bits >> 7) & 0xFF]++;
+    }
+
+    // Select top_n most frequent exponents via N passes over 256 entries (no heap alloc).
+    // 7 passes × 256 = 1792 comparisons — faster than sorting + vector overhead.
+    int original_top[7];
+    bool used[256] = {false};
+    int n_found = 0;
+
+    for (int t = 0; t < top_n; ++t) {
+        int best_exp = -1;
+        int best_count = 0;
+        for (int e = 0; e < 256; ++e) {
+            if (!used[e] && exponent_counts_arr[e] > best_count) {
+                best_count = exponent_counts_arr[e];
+                best_exp = e;
             }
         }
-    }
-
-    // Build frequency pairs (ascending key order, same as std::map iteration) and sort
-    std::vector<std::pair<int, int>> exponent_counts;
-    exponent_counts.reserve(256);
-    for (int e = 0; e < 256; ++e) {
-        if (exponent_counts_arr[e] > 0) {
-            exponent_counts.push_back(std::make_pair(e, exponent_counts_arr[e]));
+        if (best_exp >= 0) {
+            original_top[n_found++] = best_exp;
+            used[best_exp] = true;
         }
-    }
-    std::sort(exponent_counts.begin(), exponent_counts.end(),
-              [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                  return a.second > b.second;  // Sort by frequency in descending order
-              });
-
-    // Extract original values of top_n exponents
-    std::vector<int> original_top;
-    for (int i = 0; i < std::min(top_n, (int)exponent_counts.size()); i++) {
-        original_top.push_back(exponent_counts[i].first);
     }
 
     // Fill with default values if fewer than top_n exponents found
-    while (original_top.size() < top_n) {
-        original_top.push_back(127 - original_top.size());
+    while (n_found < top_n) {
+        original_top[n_found] = 127 - n_found;
+        n_found++;
     }
 
-    // Sort original top exponents
-    std::sort(original_top.begin(), original_top.end());
-    // Use sorted top-k values as continuity start candidates (smallest first).
-    const std::vector<int> top_start_candidates = original_top;
+    // Sort top exponents (only 7 elements)
+    std::sort(original_top, original_top + top_n);
 
-    // Check continuity and handle outliers
-    bool has_outlier = false;
-    std::vector<int> continuous_top;
-
-    // try each top-k exponent as a start (no +1 sweep).
-    for (size_t c = 0; c < top_start_candidates.size(); ++c) {
-        const int current_exp = top_start_candidates[c];
-        if (current_exp < 0 || current_exp + top_n - 1 > 255) {
-            continue;
-        }
+    // Try each top-k exponent as a start for a contiguous range of top_n
+    bool found_continuous = false;
+    for (int c = 0; c < top_n; ++c) {
+        const int start = original_top[c];
+        if (start < 0 || start + top_n - 1 > 255) continue;
 
         bool all_exist = true;
         for (int i = 0; i < top_n; ++i) {
-            if (exponent_counts_arr[current_exp + i] <= 0) {
+            if (exponent_counts_arr[start + i] <= 0) {
                 all_exist = false;
                 break;
             }
         }
-        if (!all_exist) {
-            continue;
-        }
+        if (!all_exist) continue;
 
-        continuous_top.clear();
-        for (int i = 0; i < top_n; ++i) {
-            continuous_top.push_back(current_exp + i);
-        }
+        for (int i = 0; i < top_n; ++i)
+            top_exponents[i] = start + i;
+        found_continuous = true;
         break;
     }
-    
-    // If not enough continuous exponents found, use most frequent continuous interval
-    if (continuous_top.size() < top_n) {
-        continuous_top.clear();
+
+    // If no contiguous range found, find longest continuous interval among top exponents
+    if (!found_continuous) {
         int best_start = original_top[0];
         int max_length = 1;
         int current_length = 1;
-        
-        // Find longest continuous interval
-        for (size_t i = 1; i < original_top.size(); i++) {
+
+        for (int i = 1; i < top_n; i++) {
             if (original_top[i] == original_top[i-1] + 1) {
                 current_length++;
                 if (current_length > max_length) {
@@ -285,44 +265,10 @@ void analyzeExponentDistribution_BF16(__nv_bfloat16* matrix, int M, int K, int* 
                 current_length = 1;
             }
         }
-        
-        // Construct result
-        for (int i = 0; i < top_n; i++) {
-            if (i < max_length) {
-                continuous_top.push_back(best_start + i);
-            } else {
-                // Fill remaining positions
-                continuous_top.push_back(continuous_top.back() + 1);
-            }
-        }
-        
-        has_outlier = true;
+
+        for (int i = 0; i < top_n; i++)
+            top_exponents[i] = best_start + i;
     }
-    
-    // Check if adjustment needed to get fully continuous sequence
-    if (continuous_top.size() > top_n) {
-        continuous_top.resize(top_n);
-    }
-    
-    // Copy result to output array
-    for (int i = 0; i < top_n; i++) {
-        top_exponents[i] = continuous_top[i];
-    }
-    
-    // // Output warning information
-    // if (has_outlier) {
-    //     std::cerr << "WARNING: Original top exponents were not continuous. Constructed continuous range: ";
-    //     for (int i = 0; i < top_n; i++ ) {
-    //         std::cerr << top_exponents[i] << " ";
-    //     }
-    //     std::cerr << std::endl;
-        
-    //     std::cerr << "Original top exponents (sorted): ";
-    //     for (int exp : original_top) {
-    //         std::cerr << exp << " ";
-    //     }
-    //     std::cerr << std::endl;
-    // }
 }
 
 
