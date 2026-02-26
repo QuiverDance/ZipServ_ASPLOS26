@@ -73,3 +73,71 @@ __host__ int InitBF16MatrixTripleBitmap(
     int& max_high_freq_count,  // Return max high-freq element count
     int& max_full_count);       // Return max non-high-freq element count
 
+// Buffer-reuse version: all buffers pre-allocated by caller, zero malloc/free inside
+__host__ int InitBF16MatrixTripleBitmap_Reuse(
+    __nv_bfloat16* A_bf16,
+    int M,
+    int K,
+    int tile_M,
+    int tile_M_median,
+    int tile_M_global,
+    int tile_K,
+    int tile_K_median,
+    int tile_K_global,
+    const int* top_exponents,
+    // Pre-allocated output buffers
+    uint8_t* sign_mantissa,
+    __nv_bfloat16* compressed_full,
+    uint64_t* bitmap1,
+    uint64_t* bitmap2,
+    uint64_t* bitmap3,
+    int* TileOffsets,
+    int* TileOffsets_median,
+    int* TileOffsets_global,
+    // Pre-allocated temp workspace
+    uint8_t* temp_sm,
+    __nv_bfloat16* temp_full,
+    int* gt_hf_count,
+    int* gt_full_count,
+    int* hf_offsets,
+    int* full_offsets,
+    // Outputs
+    int& max_high_freq_count,
+    int& max_full_count,
+    int& out_total_hf,
+    int& out_total_full);
+
+// SIMD-accelerated version of InitBF16MatrixTripleBitmap_Reuse
+__host__ int InitBF16MatrixTripleBitmap_Reuse_SIMD(
+    __nv_bfloat16* A_bf16,
+    int M,
+    int K,
+    int tile_M,
+    int tile_M_median,
+    int tile_M_global,
+    int tile_K,
+    int tile_K_median,
+    int tile_K_global,
+    const int* top_exponents,
+    // Pre-allocated output buffers
+    uint8_t* sign_mantissa,
+    __nv_bfloat16* compressed_full,
+    uint64_t* bitmap1,
+    uint64_t* bitmap2,
+    uint64_t* bitmap3,
+    int* TileOffsets,
+    int* TileOffsets_median,
+    int* TileOffsets_global,
+    // Pre-allocated temp workspace
+    uint8_t* temp_sm,
+    __nv_bfloat16* temp_full,
+    int* gt_hf_count,
+    int* gt_full_count,
+    int* hf_offsets,
+    int* full_offsets,
+    // Outputs
+    int& max_high_freq_count,
+    int& max_full_count,
+    int& out_total_hf,
+    int& out_total_full);
+
