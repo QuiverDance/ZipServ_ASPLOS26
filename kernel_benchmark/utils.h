@@ -234,30 +234,36 @@ void analyzeExponentDistribution_BF16(__nv_bfloat16* matrix, int M, int K, int* 
 
     // Sort original top exponents
     std::sort(original_top.begin(), original_top.end());
+    // Use sorted top-k values as continuity start candidates (smallest first).
+    const std::vector<int> top_start_candidates = original_top;
 
     // Check continuity and handle outliers
     bool has_outlier = false;
     std::vector<int> continuous_top;
-    int start_exp = original_top[0];
 
-    // Attempt to construct continuous exponent range
-    for (int try_offset = 0; try_offset <= original_top.back() - start_exp; try_offset++) {
-        continuous_top.clear();
-        int current_exp = start_exp + try_offset;
-        int found_count = 0;
+    // try each top-k exponent as a start (no +1 sweep).
+    for (size_t c = 0; c < top_start_candidates.size(); ++c) {
+        const int current_exp = top_start_candidates[c];
+        if (current_exp < 0 || current_exp + top_n - 1 > 255) {
+            continue;
+        }
 
-        // Attempt to construct continuous sequence starting with current_exp
-        for (int i = 0; i < top_n; i++) {
-            if (current_exp + i < 256 && exponent_counts_arr[current_exp + i] > 0) {
-                continuous_top.push_back(current_exp + i);
-                found_count++;
+        bool all_exist = true;
+        for (int i = 0; i < top_n; ++i) {
+            if (exponent_counts_arr[current_exp + i] <= 0) {
+                all_exist = false;
+                break;
             }
         }
-
-        // If enough continuous exponents found
-        if (found_count >= top_n) {
-            break;
+        if (!all_exist) {
+            continue;
         }
+
+        continuous_top.clear();
+        for (int i = 0; i < top_n; ++i) {
+            continuous_top.push_back(current_exp + i);
+        }
+        break;
     }
     
     // If not enough continuous exponents found, use most frequent continuous interval
@@ -731,6 +737,4 @@ int InitBF16MatrixTripleBitmap_Host(
         max_high_freq_count, max_full_count
     );
 }
-
-
 
