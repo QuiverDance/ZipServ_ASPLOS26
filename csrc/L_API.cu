@@ -644,7 +644,6 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse(
     }
 
     // ========== Pass 1: single-pass processing with flattened tile loop ==========
-    #pragma omp parallel for schedule(dynamic) if(num_global_tiles >= 8)
     for (int gt = 0; gt < num_global_tiles; ++gt) {
         const int gm = gt / num_global_tiles_K;
         const int gk = gt % num_global_tiles_K;
@@ -758,7 +757,6 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse(
     out_total_full = full_offsets[num_global_tiles];
 
     // ========== Pass 3: scatter from temp buffers to final arrays ==========
-    #pragma omp parallel for schedule(static) if(num_global_tiles >= 8)
     for (int gt = 0; gt < num_global_tiles; ++gt) {
         if (gt_hf_count[gt] > 0)
             memcpy(sign_mantissa + hf_offsets[gt],
@@ -891,7 +889,6 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse_SIMD(
     const __m128i v_zero   = _mm_setzero_si128();
 
     // ========== Pass 1: SIMD-accelerated processing ==========
-    #pragma omp parallel for schedule(dynamic) if(num_global_tiles >= 8)
     for (int gt = 0; gt < num_global_tiles; ++gt) {
         const int gm   = gt / num_global_tiles_K;
         const int gk   = gt % num_global_tiles_K;
@@ -1042,7 +1039,6 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse_SIMD(
     out_total_full = full_offsets[num_global_tiles];
 
     // ========== Pass 3: scatter from temp buffers to final arrays ==========
-    #pragma omp parallel for schedule(static) if(num_global_tiles >= 8)
     for (int gt = 0; gt < num_global_tiles; ++gt) {
         if (gt_hf_count[gt] > 0)
             memcpy(sign_mantissa + hf_offsets[gt],
