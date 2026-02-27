@@ -3,7 +3,8 @@
  *
  * Measures total compression latency as a function of the number of
  * input KV-cache files (1, 2, 4, ..., 512) across three compression
- * methods: Single (1 thread), MT (OpenMP), MT-AVX (OpenMP + SIMD).
+ * methods: Single (1 thread), MT (OpenMP), MT-AVX (OpenMP + SIMD),
+ * and bitcomp (nvCOMP host-side lossless compression).
  *
  * Pipeline per file:
  *   Split (chunk_len=16) → parallel { Analyze → Compress } per chunk
@@ -34,9 +35,13 @@
 #include <vector>
 #include <omp.h>
 
+#include <map>
+
 #include "L_API.cuh"
 #include "bench_manifest_utils.h"
 #include "csv_writer.h"
+
+#include <nvcomp/native/bitcomp.h>
 
 // ===== Configuration =====
 static const int kFileCounts[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
@@ -44,13 +49,14 @@ static const int kNumFileCounts = sizeof(kFileCounts) / sizeof(kFileCounts[0]);
 static const int64_t kChunkLen = 16;
 
 enum CompressMethod {
-    METHOD_SINGLE = 0,
-    METHOD_MT     = 1,
-    METHOD_MT_AVX = 2,
-    METHOD_COUNT  = 3
+    METHOD_SINGLE  = 0,
+    METHOD_MT      = 1,
+    METHOD_MT_AVX  = 2,
+    METHOD_BITCOMP = 3,
+    METHOD_COUNT   = 4
 };
 
-static const char* kMethodNames[] = {"Single", "MT", "MT-AVX"};
+static const char* kMethodNames[] = {"Single", "MT", "MT-AVX", "bitcomp"};
 
 // ===== Program Options =====
 struct ProgramOptions {
@@ -386,6 +392,49 @@ bool IsSupportedBf16Descr(const std::string& descr) {
 int RoundUpTo64(int x) { return ((x + 63) / 64) * 64; }
 
 // ===== LoadBf16WithAnalysis (BF16 copy + exponent analysis) =====
+// Load BF16 data with zero-padding only (no exponent analysis).
+// Used by bitcomp which does not need ZipServ-specific exponent info.
+bool LoadBf16(const NpyInfo& info,
+              const std::vector<uint8_t>& raw,
+              int64_t seq_begin,
+              int64_t seq_count,
+              std::vector<__nv_bfloat16>* out,
+              int* padded_rows_out,
+              int* padded_cols_out,
+              std::string* error) {
+    if (info.shape.size() != 3) { *error = "non_3d_shape"; return false; }
+    const int64_t t = info.shape[0];
+    const int64_t h = info.shape[1];
+    const int64_t d = info.shape[2];
+    if (t <= 0 || h <= 0 || d <= 0) { *error = "shape_has_non_positive_dimension"; return false; }
+    if (seq_begin < 0 || seq_count <= 0 || seq_begin + seq_count > t) {
+        *error = "invalid_seq_chunk_range"; return false;
+    }
+
+    const int mapped_rows = static_cast<int>(seq_count * h);
+    const int mapped_cols = static_cast<int>(d);
+    const int padded_rows = RoundUpTo64(mapped_rows);
+    const int padded_cols = RoundUpTo64(mapped_cols);
+    *padded_rows_out = padded_rows;
+    *padded_cols_out = padded_cols;
+
+    const size_t input_numel = static_cast<size_t>(padded_rows) * static_cast<size_t>(padded_cols);
+    out->assign(input_numel, __float2bfloat16(0.0f));
+
+    const uint16_t* bf16_bits = reinterpret_cast<const uint16_t*>(raw.data() + info.data_offset);
+    const size_t seq_row_base = static_cast<size_t>(seq_begin) * static_cast<size_t>(h);
+    uint16_t* out_data = reinterpret_cast<uint16_t*>(out->data());
+
+    for (int r = 0; r < mapped_rows; ++r) {
+        const size_t global_row = seq_row_base + static_cast<size_t>(r);
+        const uint16_t* src_row = bf16_bits + global_row * static_cast<size_t>(mapped_cols);
+        uint16_t* dst_row = out_data + static_cast<size_t>(r) * static_cast<size_t>(padded_cols);
+        std::memcpy(dst_row, src_row, static_cast<size_t>(mapped_cols) * sizeof(uint16_t));
+    }
+    return true;
+}
+
+// Load BF16 data with zero-padding AND exponent analysis (for ZipServ).
 bool LoadBf16WithAnalysis(const NpyInfo& info,
                           const std::vector<uint8_t>& raw,
                           int64_t seq_begin,
@@ -541,6 +590,75 @@ void FreeReusableBuffers(CompressReusableBuffers* rb) {
 }
 
 // ===================================================================
+// bitcomp host compression helpers (CPU-only, no GPU required)
+// ===================================================================
+const char* BitcompResultToString(bitcompResult_t result) {
+    switch (result) {
+        case BITCOMP_SUCCESS:                    return "BITCOMP_SUCCESS";
+        case BITCOMP_INVALID_PARAMETER:          return "BITCOMP_INVALID_PARAMETER";
+        case BITCOMP_INVALID_COMPRESSED_DATA:    return "BITCOMP_INVALID_COMPRESSED_DATA";
+        case BITCOMP_INVALID_ALIGNMENT:          return "BITCOMP_INVALID_ALIGNMENT";
+        case BITCOMP_INVALID_INPUT_LENGTH:       return "BITCOMP_INVALID_INPUT_LENGTH";
+        case BITCOMP_CUDA_KERNEL_LAUNCH_ERROR:   return "BITCOMP_CUDA_KERNEL_LAUNCH_ERROR";
+        case BITCOMP_CUDA_API_ERROR:             return "BITCOMP_CUDA_API_ERROR";
+        case BITCOMP_UNKNOWN_ERROR:              return "BITCOMP_UNKNOWN_ERROR";
+        default:                                 return "BITCOMP_UNRECOGNIZED_ERROR";
+    }
+}
+
+bool BitcompStatusOk(bitcompResult_t status, const char* what, std::string* error) {
+    if (status == BITCOMP_SUCCESS) return true;
+    std::ostringstream oss;
+    oss << what << " failed: " << BitcompResultToString(status)
+        << " (" << static_cast<int>(status) << ")";
+    *error = oss.str();
+    return false;
+}
+
+// Per-thread bitcomp context (pure host memory, no GPU)
+struct BitcompHostContext {
+    void* output_buf = nullptr;       // 64-bit aligned host buffer
+    size_t output_buf_size = 0;
+    std::map<size_t, bitcompHandle_t> plan_cache;  // input_bytes → handle
+};
+
+bool AllocBitcompHostContext(size_t max_input_bytes, BitcompHostContext* ctx, std::string* error) {
+    ctx->output_buf_size = bitcompMaxBuflen(max_input_bytes);
+    if (ctx->output_buf_size == 0) {
+        *error = "bitcompMaxBuflen returned 0";
+        return false;
+    }
+    ctx->output_buf = aligned_alloc(8, ctx->output_buf_size);
+    if (!ctx->output_buf) {
+        *error = "aligned_alloc failed for bitcomp output buffer";
+        return false;
+    }
+    return true;
+}
+
+bool EnsureBitcompPlan(BitcompHostContext* ctx, size_t input_bytes, std::string* error) {
+    if (ctx->plan_cache.count(input_bytes)) return true;
+    bitcompHandle_t handle = nullptr;
+    bitcompResult_t st = bitcompCreatePlan(
+        &handle, input_bytes,
+        BITCOMP_UNSIGNED_16BIT, BITCOMP_LOSSLESS, BITCOMP_DEFAULT_ALGO);
+    if (!BitcompStatusOk(st, "bitcompCreatePlan", error)) return false;
+    ctx->plan_cache[input_bytes] = handle;
+    return true;
+}
+
+void FreeBitcompHostContext(BitcompHostContext* ctx) {
+    for (std::map<size_t, bitcompHandle_t>::iterator it = ctx->plan_cache.begin();
+         it != ctx->plan_cache.end(); ++it) {
+        if (it->second != nullptr) bitcompDestroyPlan(it->second);
+    }
+    ctx->plan_cache.clear();
+    free(ctx->output_buf);
+    ctx->output_buf = nullptr;
+    ctx->output_buf_size = 0;
+}
+
+// ===================================================================
 // Core benchmark logic
 // ===================================================================
 
@@ -551,7 +669,8 @@ void ProcessAllFiles(const std::vector<int>& work_indices,
                      CompressMethod method,
                      std::vector<CompressReusableBuffers>& thread_bufs,
                      std::vector<std::vector<__nv_bfloat16>>& thread_bf16_bufs,
-                     CompressionStats* stats = nullptr) {
+                     CompressionStats* stats = nullptr,
+                     std::vector<BitcompHostContext>* bitcomp_ctxs = nullptr) {
     for (size_t fi = 0; fi < work_indices.size(); ++fi) {
         const PreloadedFile& file = files[static_cast<size_t>(work_indices[fi])];
         const int64_t t = file.info.shape[0];
@@ -567,23 +686,47 @@ void ProcessAllFiles(const std::vector<int>& work_indices,
             const int64_t seq_begin = idx * kChunkLen;
             const int64_t seq_count = std::min(kChunkLen, t - seq_begin);
 
-            // === Analyze (reuse pre-allocated per-thread buffer) ===
+            // === Load BF16 data (reuse pre-allocated per-thread buffer) ===
             std::vector<__nv_bfloat16>& bf16_data = thread_bf16_bufs[static_cast<size_t>(tid)];
             int padded_rows = 0, padded_cols = 0;
             int top_exponents[7];
             std::string error;
 
-            if (!LoadBf16WithAnalysis(file.info, file.raw,
-                                      seq_begin, seq_count,
-                                      &bf16_data,
-                                      &padded_rows, &padded_cols,
-                                      top_exponents, &error)) {
-                continue;  // skip failed chunks
+            const bool need_analysis = (method != METHOD_BITCOMP);
+            bool load_ok = false;
+            if (need_analysis) {
+                load_ok = LoadBf16WithAnalysis(file.info, file.raw,
+                                               seq_begin, seq_count,
+                                               &bf16_data,
+                                               &padded_rows, &padded_cols,
+                                               top_exponents, &error);
+            } else {
+                load_ok = LoadBf16(file.info, file.raw,
+                                   seq_begin, seq_count,
+                                   &bf16_data,
+                                   &padded_rows, &padded_cols, &error);
             }
+            if (!load_ok) continue;  // skip failed chunks
 
             // === Compress ===
             int max_hf = 0, max_full = 0, total_hf = 0, total_full = 0;
-            if (method == METHOD_MT_AVX) {
+            if (method == METHOD_BITCOMP && bitcomp_ctxs != nullptr) {
+                BitcompHostContext& bc = (*bitcomp_ctxs)[static_cast<size_t>(tid)];
+                const size_t input_bytes = static_cast<size_t>(padded_rows) * padded_cols * 2;
+                std::string bc_error;
+                if (!EnsureBitcompPlan(&bc, input_bytes, &bc_error)) {
+                    continue;
+                }
+                bitcompHandle_t handle = bc.plan_cache[input_bytes];
+                bitcompHostCompressLossless(handle, bf16_data.data(), bc.output_buf);
+
+                if (stats) {
+                    size_t comp_bytes = 0;
+                    bitcompGetCompressedSize(bc.output_buf, &comp_bytes);
+                    file_orig += input_bytes;
+                    file_comp += comp_bytes;
+                }
+            } else if (method == METHOD_MT_AVX) {
                 InitBF16MatrixTripleBitmap_Reuse_SIMD(
                     bf16_data.data(), padded_rows, padded_cols,
                     8, 16, 64, 8, 64, 64,
@@ -610,18 +753,19 @@ void ProcessAllFiles(const std::vector<int>& work_indices,
                     max_hf, max_full, total_hf, total_full);
             }
 
-            // === Collect stats (only when requested, outside timed loop) ===
-            if (stats) {
+            // === Collect stats for ZipServ methods (only when requested) ===
+            if (stats && method != METHOD_BITCOMP) {
                 const size_t orig = static_cast<size_t>(padded_rows) * padded_cols * 2;
                 const int nt  = (padded_rows / 8) * (padded_cols / 8);
                 const int nmt = (padded_rows / 16) * (padded_cols / 64);
                 const int ngt = (padded_rows / 64) * (padded_cols / 64);
-                const size_t comp = static_cast<size_t>(total_hf)
-                                  + static_cast<size_t>(total_full) * 2
-                                  + static_cast<size_t>(nt) * 3 * 8
-                                  + static_cast<size_t>(nt) * 2 * 4
-                                  + static_cast<size_t>(nmt) * 2 * 4
-                                  + static_cast<size_t>(ngt + 1) * 2 * 4;
+                const size_t comp = static_cast<size_t>(total_hf)           // sign+mantissa (1B per half-format value)
+                                  + static_cast<size_t>(total_full) * 2  // full BF16 values (2B each)
+                                  + static_cast<size_t>(nt) * 3 * 8     // 3 bitmaps per 8x8 tile (uint64_t each)
+                                  + static_cast<size_t>(nt) * 2 * 4     // tile_offsets (2 ints per 8x8 tile)
+                                  + static_cast<size_t>(nmt) * 2 * 4    // tile_offsets_median (2 ints per 16x64 tile)
+                                  + static_cast<size_t>(ngt + 1) * 2 * 4 // tile_offsets_global (2 ints per 64x64 tile + 1)
+                                  + 7 * sizeof(int);                     // top_exponents (7 contiguous exponent values)
                 file_orig += orig;
                 file_comp += comp;
             }
@@ -741,8 +885,10 @@ int main(int argc, char** argv) {
               << std::setw(14) << "MT Comp"
               << std::setw(14) << "MT-AVX(ms)"
               << std::setw(14) << "MT-AVX Comp"
+              << std::setw(14) << "bitcomp(ms)"
+              << std::setw(14) << "bitcomp Comp"
               << "\n";
-    std::cout << std::string(96, '-') << "\n";
+    std::cout << std::string(124, '-') << "\n";
 
     std::vector<ScalingResult> results;
     results.reserve(kNumFileCounts * METHOD_COUNT);
@@ -795,16 +941,44 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // Allocate per-thread bitcomp host contexts
+            std::vector<BitcompHostContext> bitcomp_ctxs;
+            if (method == METHOD_BITCOMP) {
+                const size_t max_input_bytes =
+                    static_cast<size_t>(global_max_padded_rows) * global_max_padded_cols * 2;
+                bitcomp_ctxs.resize(static_cast<size_t>(num_threads));
+                bool bc_alloc_ok = true;
+                for (int t = 0; t < num_threads; ++t) {
+                    std::string bc_error;
+                    if (!AllocBitcompHostContext(max_input_bytes,
+                            &bitcomp_ctxs[static_cast<size_t>(t)], &bc_error)) {
+                        std::cerr << "AllocBitcompHostContext failed: " << bc_error << "\n";
+                        bc_alloc_ok = false;
+                        break;
+                    }
+                }
+                if (!bc_alloc_ok) {
+                    for (int t = 0; t < num_threads; ++t) {
+                        FreeBitcompHostContext(&bitcomp_ctxs[static_cast<size_t>(t)]);
+                        FreeReusableBuffers(&thread_bufs[static_cast<size_t>(t)]);
+                    }
+                    method_latencies[m] = -1.0;
+                    continue;
+                }
+            }
+
             // Warmup
             for (int w = 0; w < opts.warmup; ++w) {
-                ProcessAllFiles(work_indices, preloaded, method, thread_bufs, thread_bf16_bufs);
+                ProcessAllFiles(work_indices, preloaded, method, thread_bufs, thread_bf16_bufs,
+                    nullptr, (method == METHOD_BITCOMP) ? &bitcomp_ctxs : nullptr);
             }
 
             // Timed iterations
             double total_ms = 0.0;
             for (int iter = 0; iter < opts.iters; ++iter) {
                 const auto wall_begin = std::chrono::high_resolution_clock::now();
-                ProcessAllFiles(work_indices, preloaded, method, thread_bufs, thread_bf16_bufs);
+                ProcessAllFiles(work_indices, preloaded, method, thread_bufs, thread_bf16_bufs,
+                    nullptr, (method == METHOD_BITCOMP) ? &bitcomp_ctxs : nullptr);
                 const auto wall_end = std::chrono::high_resolution_clock::now();
                 total_ms += std::chrono::duration<double, std::milli>(wall_end - wall_begin).count();
             }
@@ -814,7 +988,8 @@ int main(int argc, char** argv) {
 
             // Collect compression ratio (one extra untimed pass)
             CompressionStats comp_stats;
-            ProcessAllFiles(work_indices, preloaded, method, thread_bufs, thread_bf16_bufs, &comp_stats);
+            ProcessAllFiles(work_indices, preloaded, method, thread_bufs, thread_bf16_bufs, &comp_stats,
+                (method == METHOD_BITCOMP) ? &bitcomp_ctxs : nullptr);
             const double ratio = comp_stats.Ratio();
             method_ratios[m] = ratio;
 
@@ -826,6 +1001,10 @@ int main(int argc, char** argv) {
             results.push_back(sr);
 
             // Cleanup
+            if (method == METHOD_BITCOMP) {
+                for (int t = 0; t < num_threads; ++t)
+                    FreeBitcompHostContext(&bitcomp_ctxs[static_cast<size_t>(t)]);
+            }
             for (int t = 0; t < num_threads; ++t)
                 FreeReusableBuffers(&thread_bufs[static_cast<size_t>(t)]);
         }
@@ -847,7 +1026,7 @@ int main(int argc, char** argv) {
         std::cout.flush();
     }
 
-    std::cout << std::string(96, '-') << "\n";
+    std::cout << std::string(124, '-') << "\n";
 
     // ---- Step 3: Write CSV ----
     std::ofstream csv(opts.out_csv.c_str(), std::ios::out | std::ios::trunc);
@@ -860,7 +1039,8 @@ int main(int argc, char** argv) {
         csv << results[i].file_count << ","
             << kMethodNames[results[i].method] << ","
             << FormatDouble(results[i].latency_ms) << ","
-            << FormatDouble(results[i].comp_ratio, 2) << "\n";
+            << FormatDouble(results[i].comp_ratio, 2);
+        csv << "\n";
     }
     csv.close();
     std::cout << "CSV written to: " << opts.out_csv << "\n";
