@@ -1,7 +1,6 @@
 #include <assert.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -24,7 +23,6 @@
 #include <sys/stat.h>
 #include <vector>
 #include <omp.h>
-#include <immintrin.h>
 
 #include "L_API.cuh"
 #include "bench_manifest_utils.h"
@@ -631,9 +629,11 @@ bool ParseNpyInfo(const std::vector<uint8_t>& raw, NpyInfo* info, std::string* e
     return true;
 }
 
-bool IsSupportedFloat16Descr(const std::string& descr) {
-    // ZipServ benchmark path expects little-endian fp16 source.
-    return descr == "<f2" || descr == "=f2" || descr == "f2" || descr == "|f2";
+bool IsSupportedBf16Descr(const std::string& descr) {
+    // BF16 bit-patterns stored as 2-byte scalars in NPY.
+    // Accept raw 2-byte payload dtypes that preserve bit-exact BF16 values.
+    return descr == "|V2" || descr == "<V2" || descr == "V2" ||
+           descr == "|u2" || descr == "<u2" || descr == "u2";
 }
 
 int RoundUpTo64(int x) {
@@ -716,23 +716,23 @@ void CollectExponentCoverageFromHistogram(
                           : 0.0;
 }
 
-// Fused FP16->BF16 conversion + exponent analysis in a single SIMD-accelerated pass.
+// Load BF16 + exponent analysis in a single pass.
 // Returns the exponent histogram for CollectExponentCoverageFromHistogram.
-bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
-                                   const std::vector<uint8_t>& raw,
-                                   int64_t seq_begin,
-                                   int64_t seq_count,
-                                   std::vector<__nv_bfloat16>* out,
-                                   int* mapped_rows_out,
-                                   int* mapped_cols_out,
-                                   int* padded_rows_out,
-                                   int* padded_cols_out,
-                                   size_t* logical_numel,
-                                   size_t* input_numel,
-                                   double* convert_ms,
-                                   int* top_exponents,
-                                   int* exponent_counts_out,
-                                   std::string* error) {
+bool LoadBf16WithAnalysis(const NpyInfo& info,
+                          const std::vector<uint8_t>& raw,
+                          int64_t seq_begin,
+                          int64_t seq_count,
+                          std::vector<__nv_bfloat16>* out,
+                          int* mapped_rows_out,
+                          int* mapped_cols_out,
+                          int* padded_rows_out,
+                          int* padded_cols_out,
+                          size_t* logical_numel,
+                          size_t* input_numel,
+                          double* convert_ms,
+                          int* top_exponents,
+                          int* exponent_counts_out,
+                          std::string* error) {
     if (info.shape.size() != 3) {
         *error = "non_3d_shape";
         return false;
@@ -785,10 +785,10 @@ bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
         return false;
     }
 
-    const size_t expected_fp16_bytes = full_numel * sizeof(uint16_t);
-    if (info.data_bytes != expected_fp16_bytes) {
+    const size_t expected_bf16_bytes = full_numel * sizeof(uint16_t);
+    if (info.data_bytes != expected_bf16_bytes) {
         std::ostringstream oss;
-        oss << "npy_data_bytes_mismatch(expected=" << expected_fp16_bytes
+        oss << "npy_data_bytes_mismatch(expected=" << expected_bf16_bytes
             << ",got=" << info.data_bytes << ")";
         *error = oss.str();
         return false;
@@ -796,7 +796,7 @@ bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
 
     out->assign(input_numel_local, __float2bfloat16(0.0f));
 
-    const uint16_t* fp16_bits = reinterpret_cast<const uint16_t*>(raw.data() + info.data_offset);
+    const uint16_t* bf16_bits = reinterpret_cast<const uint16_t*>(raw.data() + info.data_offset);
     const size_t seq_row_base = static_cast<size_t>(seq_begin) * static_cast<size_t>(h);
     uint16_t* out_data = reinterpret_cast<uint16_t*>(out->data());
 
@@ -805,58 +805,13 @@ bool ConvertFp16ToBf16WithAnalysis(const NpyInfo& info,
 
     const std::chrono::high_resolution_clock::time_point begin = std::chrono::high_resolution_clock::now();
 
-    // SIMD constants
-    const __m256i v_round_bias = _mm256_set1_epi32(0x7FFF);
-    const __m256i v_one_32 = _mm256_set1_epi32(1);
-    const __m128i v_0xFF = _mm_set1_epi16(0xFF);
-    const int simd_width = 8;
-    const int aligned_cols = mapped_cols & ~(simd_width - 1);
-
     for (int r = 0; r < mapped_rows; ++r) {
         const size_t global_row = seq_row_base + static_cast<size_t>(r);
-        const uint16_t* src_row = fp16_bits + global_row * static_cast<size_t>(mapped_cols);
+        const uint16_t* src_row = bf16_bits + global_row * static_cast<size_t>(mapped_cols);
         uint16_t* dst_row = out_data + static_cast<size_t>(r) * static_cast<size_t>(padded_cols);
-
-        int c = 0;
-        // SIMD path: 8 FP16 -> 8 BF16 per iteration using F16C
-        for (; c < aligned_cols; c += simd_width) {
-            // 1) Load 8 x FP16
-            __m128i fp16_8 = _mm_loadu_si128((const __m128i*)(src_row + c));
-            // 2) FP16 -> FP32 via F16C
-            __m256 fp32_8 = _mm256_cvtph_ps(fp16_8);
-            __m256i fp32_bits = _mm256_castps_si256(fp32_8);
-            // 3) FP32 -> BF16 with round-to-nearest-even
-            __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(fp32_bits, 16), v_one_32);
-            __m256i rounded = _mm256_add_epi32(fp32_bits, _mm256_add_epi32(v_round_bias, lsb));
-            __m256i bf16_32 = _mm256_srli_epi32(rounded, 16);
-            // 4) Pack 8 x 32-bit -> 8 x 16-bit
-            __m256i packed = _mm256_packus_epi32(bf16_32, _mm256_setzero_si256());
-            __m128i lo = _mm256_castsi256_si128(packed);
-            __m128i hi = _mm256_extracti128_si256(packed, 1);
-            __m128i bf16_8 = _mm_unpacklo_epi64(lo, hi);
-            // 5) Store 8 BF16
-            _mm_storeu_si128((__m128i*)(dst_row + c), bf16_8);
-            // 6) Extract exponents and update histogram
-            __m128i exp_8 = _mm_and_si128(_mm_srli_epi16(bf16_8, 7), v_0xFF);
-            uint16_t exp_arr[8];
-            _mm_storeu_si128((__m128i*)exp_arr, exp_8);
-            exponent_counts_out[exp_arr[0]]++;
-            exponent_counts_out[exp_arr[1]]++;
-            exponent_counts_out[exp_arr[2]]++;
-            exponent_counts_out[exp_arr[3]]++;
-            exponent_counts_out[exp_arr[4]]++;
-            exponent_counts_out[exp_arr[5]]++;
-            exponent_counts_out[exp_arr[6]]++;
-            exponent_counts_out[exp_arr[7]]++;
-        }
-        // Scalar tail
-        for (; c < mapped_cols; ++c) {
-            __half_raw hr;
-            hr.x = src_row[c];
-            const __half hval = hr;
-            const __nv_bfloat16 bf = __float2bfloat16(__half2float(hval));
-            dst_row[c] = __bfloat16_as_ushort(bf);
-            exponent_counts_out[(dst_row[c] >> 7) & 0xFF]++;
+        std::memcpy(dst_row, src_row, static_cast<size_t>(mapped_cols) * sizeof(uint16_t));
+        for (int c = 0; c < mapped_cols; ++c) {
+            exponent_counts_out[(src_row[c] >> 7) & 0xFF]++;
         }
     }
 
@@ -1430,9 +1385,9 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path,
         return rows;
     }
 
-    if (!IsSupportedFloat16Descr(info.descr)) {
+    if (!IsSupportedBf16Descr(info.descr)) {
         file_row.status = "skipped";
-        file_row.note = "dtype_not_float16(descr=" + info.descr + ")";
+        file_row.note = "dtype_not_bf16(descr=" + info.descr + ")";
         rows.push_back(file_row);
         return rows;
     }
@@ -1489,7 +1444,7 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path,
     }
 
     // 2) Parallel preprocessing + compression benchmark
-    //    Pre-allocate per-thread reusable buffers, then run conversion,
+    //    Pre-allocate per-thread reusable buffers, then run BF16 load,
     //    analysis, and compression in a single parallel region.
 
     // Allocate one CompressReusableBuffers per OMP thread
@@ -1546,21 +1501,21 @@ std::vector<BenchRow> ProcessFile(const std::string& file_path,
                 int exponent_counts[256];
                 std::string local_error;
 
-                if (!ConvertFp16ToBf16WithAnalysis(info,
-                                                   raw,
-                                                   seq_begin,
-                                                   seq_count,
-                                                   &work.host_bf16,
-                                                   &mapped_rows,
-                                                   &mapped_cols,
-                                                   &padded_rows,
-                                                   &padded_cols,
-                                                   &row.logical_numel,
-                                                   &row.input_numel,
-                                                   &row.convert_ms,
-                                                   work.top_exponents.data(),
-                                                   exponent_counts,
-                                                   &local_error)) {
+                if (!LoadBf16WithAnalysis(info,
+                                          raw,
+                                          seq_begin,
+                                          seq_count,
+                                          &work.host_bf16,
+                                          &mapped_rows,
+                                          &mapped_cols,
+                                          &padded_rows,
+                                          &padded_cols,
+                                          &row.logical_numel,
+                                          &row.input_numel,
+                                          &row.convert_ms,
+                                          work.top_exponents.data(),
+                                          exponent_counts,
+                                          &local_error)) {
                     row.status = (local_error == "non_3d_shape") ? "skipped" : "failed";
                     row.note = local_error;
                     continue;
@@ -1871,7 +1826,7 @@ std::string FormatTop7WithCover(const std::string& top7, double cover_ratio) {
 }
 
 void PrintRowHeader() {
-    std::cout << std::string(214, '-') << "\n";
+    std::cout << std::string(197, '-') << "\n";
     std::cout << std::left
               << std::setw(14) << "TensorID"
               << std::setw(14) << "Shape3D"
@@ -1879,16 +1834,14 @@ void PrintRowHeader() {
               << std::setw(14) << "Padded2D"
               << std::setw(13) << "OrigL(B)"
               << std::setw(13) << "Comp(B)"
-              << std::setw(9) << "RatioL"
               << std::setw(9) << "RatioIn"
               << std::setw(38) << "Top7Raw"
               << std::setw(38) << "Top7Sel"
-              << std::setw(10) << "PadRatio"
               << std::setw(10) << "Conv(ms)"
               << std::setw(10) << "Comp(ms)"
               << std::setw(10) << "Decomp"
               << "\n";
-    std::cout << std::string(214, '-') << "\n";
+    std::cout << std::string(197, '-') << "\n";
 }
 
 void PrintRow(const BenchRow& row) {
@@ -1902,11 +1855,9 @@ void PrintRow(const BenchRow& row) {
               << std::setw(14) << row.padded_shape
               << std::setw(13) << (ok ? std::to_string(row.logical_bytes) : "-")
               << std::setw(13) << (ok ? std::to_string(row.compressed_bytes) : "-")
-              << std::setw(9) << (row.compressed_bytes > 0 ? FormatDouble(row.ratio_logical, 3) : "-")
               << std::setw(9) << (row.compressed_bytes > 0 ? FormatDouble(row.ratio_input, 3) : "-")
               << std::setw(38) << (ok ? top7_raw_with_cover : "-")
               << std::setw(38) << (ok ? top7_selected_with_cover : "-")
-              << std::setw(10) << (row.input_numel > 0 ? FormatDouble(row.pad_ratio, 3) : "-")
               << std::setw(10) << (ok ? FormatDouble(row.convert_ms, 3) : "-")
               << std::setw(10) << (ok ? FormatDouble(row.compress_ms, 3) : "-")
               << std::setw(10) << (ok ? FormatDouble(row.decompress_ms, 3) : "-")
@@ -1915,8 +1866,8 @@ void PrintRow(const BenchRow& row) {
 
 void WriteCSVHeader(std::ofstream* ofs) {
     (*ofs)
-        << "tensor_id,shape3d,mapped2d,padded2d,origl_b,comp_b,ratio_l,ratio_in,"
-        << "top7_raw,top7_sel,pad_ratio,conv_ms,comp_ms,decomp_ms\n";
+        << "tensor_id,shape3d,mapped2d,padded2d,origl_b,comp_b,ratio_in,"
+        << "top7_raw,top7_sel,conv_ms,comp_ms,decomp_ms\n";
 }
 
 void WriteCSVRow(std::ofstream* ofs, const BenchRow& row) {
@@ -1930,11 +1881,9 @@ void WriteCSVRow(std::ofstream* ofs, const BenchRow& row) {
         << bench_common::EscapeCSV(row.padded_shape) << ","
         << (ok ? std::to_string(row.logical_bytes) : "-") << ","
         << (ok ? std::to_string(row.compressed_bytes) : "-") << ","
-        << (row.compressed_bytes > 0 ? FormatDouble(row.ratio_logical, 3) : "-") << ","
         << (row.compressed_bytes > 0 ? FormatDouble(row.ratio_input, 3) : "-") << ","
         << bench_common::EscapeCSV(ok ? top7_raw_with_cover : "-") << ","
         << bench_common::EscapeCSV(ok ? top7_selected_with_cover : "-") << ","
-        << (row.input_numel > 0 ? FormatDouble(row.pad_ratio, 3) : "-") << ","
         << (ok ? FormatDouble(row.convert_ms, 3) : "-") << ","
         << (ok ? FormatDouble(row.compress_ms, 3) : "-") << ","
         << (ok ? FormatDouble(row.decompress_ms, 3) : "-")
@@ -1961,23 +1910,21 @@ void PrintSummary(const AggregateSummary& agg) {
               << ", skipped=" << agg.skipped
               << ", failed=" << agg.failed << "\n";
 
-    std::cout << "total_logical_bytes=" << agg.total_logical_bytes
-              << ", total_input_bytes=" << agg.total_input_bytes
+    std::cout << "total_input_bytes=" << agg.total_input_bytes
               << ", total_compressed_bytes=" << agg.total_compressed_bytes << "\n";
 
-    if (agg.total_logical_bytes > 0 || agg.total_input_bytes > 0) {
-        std::cout << "total_ratio_logical=" << FormatDouble(agg.total_ratio_logical, 4)
-                  << ", total_ratio_input=" << FormatDouble(agg.total_ratio_input, 4) << "\n";
+    if (agg.total_input_bytes > 0 || agg.total_compressed_bytes > 0) {
+        const double total_ratio_origin_comp = (agg.total_compressed_bytes > 0)
+                                                   ? static_cast<double>(agg.total_input_bytes) / static_cast<double>(agg.total_compressed_bytes)
+                                                   : 0.0;
+        std::cout << "total_ratio_input=" << FormatDouble(agg.total_ratio_input, 4)
+                  << ", total_ratio_origin_comp=" << FormatDouble(total_ratio_origin_comp, 4) << "\n";
     }
 
-    print_stats("ratio_logical", agg.ratio_logical);
     print_stats("ratio_input", agg.ratio_input);
-    print_stats("pad_ratio", agg.pad_ratio);
     print_stats("convert_ms", agg.convert_ms);
     print_stats("compress_ms", agg.compress_ms);
     print_stats("decompress_ms", agg.decompress_ms);
-    print_stats("compress_gbps_logical", agg.compress_gbps_logical);
-    print_stats("decompress_gbps_logical", agg.decompress_gbps_logical);
 }
 
 int main(int argc, char** argv) {
