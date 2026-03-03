@@ -1051,3 +1051,368 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse_SIMD(
 
     return num_global_tiles;
 }
+
+// ===================================================================
+// GPU Compression: CUDA kernel implementation of InitBF16MatrixTripleBitmap
+// Tile dimensions are hardcoded to match the ZipServ standard:
+//   tile_M=8, tile_M_median=16, tile_M_global=64
+//   tile_K=8, tile_K_median=64, tile_K_global=64
+// ===================================================================
+
+// Tile position lookup for small tiles within a 64x64 global tile.
+// Matches the host-side tile_pos[] computation used by _Reuse and _Reuse_SIMD.
+struct GPUTilePos {
+    int row_off;
+    int col_off;
+};
+
+__constant__ GPUTilePos d_zipserv_tile_pos[64];
+static bool s_zipserv_tile_pos_inited = false;
+
+static void InitZipServGPUTilePos() {
+    if (s_zipserv_tile_pos_inited) return;
+
+    const int tile_M_val = 8, tile_M_median_val = 16, tile_M_global_val = 64;
+    const int tile_K_val = 8, tile_K_median_val = 64;
+    const int num_median_m = tile_M_global_val / tile_M_median_val;
+    const int num_median_k = tile_M_global_val / tile_K_median_val;
+    const int num_small_m  = tile_M_median_val / tile_M_val;
+    const int num_small_k  = tile_K_median_val / tile_K_val;
+
+    GPUTilePos h_pos[64];
+    int tp = 0;
+    for (int mm = 0; mm < num_median_m; ++mm) {
+        for (int mk = 0; mk < num_median_k; ++mk) {
+            const int med_row = mm * tile_M_median_val;
+            const int med_col = mk * tile_K_median_val;
+            for (int mg = 0; mg < num_small_m; mg += 2) {
+                for (int kg = 0; kg < num_small_k; kg += 2) {
+                    for (int j = 0; j < 2; ++j) {
+                        for (int i = 0; i < 2; ++i) {
+                            h_pos[tp].row_off = med_row + (mg + i) * tile_M_val;
+                            h_pos[tp].col_off = med_col + (kg + j) * tile_K_val;
+                            ++tp;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    cudaMemcpyToSymbol(d_zipserv_tile_pos, h_pos, sizeof(h_pos));
+    s_zipserv_tile_pos_inited = true;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 1: Per-global-tile classification + bitmap generation + local compaction
+// Grid: num_global_tiles blocks.  Block: 64 threads (one per 8x8 small tile).
+// Two-pass design:
+//   Pass A – classify elements, build bitmaps, count hf/full per small tile
+//   Prefix sum over tile counts (block-level, sequential by thread 0)
+//   Pass B – re-read input, scatter classified data to per-GT temp buffers
+// ---------------------------------------------------------------------------
+__global__ void ZipServGPU_ClassifyAndCompact(
+    const __nv_bfloat16* __restrict__ d_input,
+    int M, int K,
+    const int* __restrict__ d_top_exponents,
+    uint64_t* __restrict__ d_bitmap1,
+    uint64_t* __restrict__ d_bitmap2,
+    uint64_t* __restrict__ d_bitmap3,
+    int* __restrict__ d_tile_offsets,
+    int* __restrict__ d_tile_offsets_median,
+    uint8_t* __restrict__ d_temp_sm,
+    __nv_bfloat16* __restrict__ d_temp_full,
+    int* __restrict__ d_gt_hf_count,
+    int* __restrict__ d_gt_full_count)
+{
+    const int kSmTileM = 8;
+    const int kSmTileK = 8;
+    const int kSmallPerGT  = 64;
+    const int kMedianPerGT = 4;
+    const int kSmallPerMedian  = 16;
+    const int kMaxSmPerGT   = 4096 + 15;
+    const int kMaxFullPerGT = 4096 + 7;
+
+    const int gt = blockIdx.x;
+    const int st = threadIdx.x;  // 0..63
+    const int num_gt_K = K / 64;
+    const int gm   = gt / num_gt_K;
+    const int gk   = gt % num_gt_K;
+    const int grow  = gm * 64;
+    const int gcol  = gk * 64;
+
+    // Shared memory
+    __shared__ uint8_t s_exp_lut[256];
+    __shared__ int s_hf_prefix[65];
+    __shared__ int s_full_prefix[65];
+
+    // Collaboratively initialise 256-byte exponent LUT (64 threads x 4B each)
+    reinterpret_cast<uint32_t*>(s_exp_lut)[st] = 0xFFFFFFFFU;
+    __syncthreads();
+    if (st < 7) {
+        s_exp_lut[d_top_exponents[st]] = static_cast<uint8_t>(st);
+    }
+    __syncthreads();
+
+    // This thread's small tile position within the global tile
+    const int row_start = grow + d_zipserv_tile_pos[st].row_off;
+    const int col_start = gcol + d_zipserv_tile_pos[st].col_off;
+
+    // ---- Pass A: classify, build bitmaps, count ----
+    uint64_t tb1 = 0, tb2 = 0, tb3 = 0;
+    uint64_t is_hf_mask = 0;
+    int t_hf = 0, t_full = 0;
+
+    #pragma unroll
+    for (int ro = 0; ro < kSmTileM; ++ro) {
+        const __nv_bfloat16* row_ptr = d_input + (row_start + ro) * K + col_start;
+        #pragma unroll
+        for (int co = 0; co < kSmTileK; ++co) {
+            const int pos = ro * kSmTileK + co;
+            const uint16_t bf16_bits = __bfloat16_as_ushort(row_ptr[co]);
+            const uint8_t exponent = (bf16_bits >> 7) & 0xFF;
+            const uint8_t eidx = s_exp_lut[exponent];
+            if (eidx != 0xFF) {
+                const int bitmap_code = eidx + 1;
+                tb1 |= ((bitmap_code & 0x1) ? 1ULL << pos : 0);
+                tb2 |= ((bitmap_code & 0x2) ? 1ULL << pos : 0);
+                tb3 |= ((bitmap_code & 0x4) ? 1ULL << pos : 0);
+                is_hf_mask |= (1ULL << pos);
+                t_hf++;
+            } else {
+                t_full++;
+            }
+        }
+    }
+
+    // Write bitmaps and per-tile counts to global memory
+    const int base_tile_idx = gt * kSmallPerGT;
+    const int tidx = base_tile_idx + st;
+    d_bitmap1[tidx] = tb1;
+    d_bitmap2[tidx] = tb2;
+    d_bitmap3[tidx] = tb3;
+    d_tile_offsets[tidx * 2]     = t_hf;
+    d_tile_offsets[tidx * 2 + 1] = t_full;
+
+    // Store counts for prefix sum
+    s_hf_prefix[st + 1]   = t_hf;
+    s_full_prefix[st + 1] = t_full;
+    if (st == 0) {
+        s_hf_prefix[0]   = 0;
+        s_full_prefix[0] = 0;
+    }
+    __syncthreads();
+
+    // Sequential prefix sum by thread 0 (only 64 elements)
+    if (st == 0) {
+        for (int i = 1; i <= kSmallPerGT; ++i) {
+            s_hf_prefix[i]   += s_hf_prefix[i - 1];
+            s_full_prefix[i] += s_full_prefix[i - 1];
+        }
+    }
+    __syncthreads();
+
+    // ---- Pass B: re-read input, write data to per-GT temp buffers ----
+    uint8_t*       my_gt_sm   = d_temp_sm   + static_cast<size_t>(gt) * kMaxSmPerGT;
+    __nv_bfloat16* my_gt_full = d_temp_full + static_cast<size_t>(gt) * kMaxFullPerGT;
+
+    int sm_idx   = s_hf_prefix[st];
+    int full_idx = s_full_prefix[st];
+
+    #pragma unroll
+    for (int ro = 0; ro < kSmTileM; ++ro) {
+        const __nv_bfloat16* row_ptr = d_input + (row_start + ro) * K + col_start;
+        #pragma unroll
+        for (int co = 0; co < kSmTileK; ++co) {
+            const int pos = ro * kSmTileK + co;
+            if (is_hf_mask & (1ULL << pos)) {
+                const uint16_t bf16_bits = __bfloat16_as_ushort(row_ptr[co]);
+                const uint8_t sign_bit = (bf16_bits >> 15) & 0x1;
+                const uint8_t mantissa = bf16_bits & 0x7F;
+                my_gt_sm[sm_idx++] = (sign_bit << 7) | mantissa;
+            } else {
+                my_gt_full[full_idx++] = row_ptr[co];
+            }
+        }
+    }
+
+    // ---- Padding + GT aggregate counts (last thread) ----
+    if (st == kSmallPerGT - 1) {
+        const int total_hf   = s_hf_prefix[kSmallPerGT];
+        const int total_full = s_full_prefix[kSmallPerGT];
+
+        const int hf_pad = (16 - (total_hf % 16)) % 16;
+        for (int p = 0; p < hf_pad; ++p)
+            my_gt_sm[total_hf + p] = 0;
+
+        const int full_pad = (8 - (total_full % 8)) % 8;
+        for (int p = 0; p < full_pad; ++p)
+            my_gt_full[total_full + p] = __float2bfloat16(0.0f);
+
+        d_gt_hf_count[gt]   = total_hf + hf_pad;
+        d_gt_full_count[gt] = total_full + full_pad;
+    }
+
+    // ---- Median tile offsets ----
+    const int base_median_idx = gt * kMedianPerGT;
+    if (st == 0) {
+        d_tile_offsets_median[base_median_idx * 2]     = 0;
+        d_tile_offsets_median[base_median_idx * 2 + 1] = 0;
+    }
+    if ((st % kSmallPerMedian) == (kSmallPerMedian - 1)) {
+        const int median_idx = st / kSmallPerMedian;
+        if (median_idx < kMedianPerGT - 1) {
+            const int midx = base_median_idx + median_idx + 1;
+            d_tile_offsets_median[midx * 2]     = s_hf_prefix[st + 1];
+            d_tile_offsets_median[midx * 2 + 1] = s_full_prefix[st + 1];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 2: Global prefix sum over per-GT counts + max/total reduction
+// Grid: 1 block, 1 thread (num_global_tiles is typically very small)
+// ---------------------------------------------------------------------------
+__global__ void ZipServGPU_PrefixSumAndMax(
+    const int* __restrict__ d_gt_hf_count,
+    const int* __restrict__ d_gt_full_count,
+    int* __restrict__ d_tile_offsets_global,
+    int* __restrict__ d_hf_offsets,
+    int* __restrict__ d_full_offsets,
+    int* __restrict__ d_max_hf,
+    int* __restrict__ d_max_full,
+    int* __restrict__ d_total_hf,
+    int* __restrict__ d_total_full,
+    int num_global_tiles)
+{
+    if (threadIdx.x != 0) return;
+
+    int max_hf = 0, max_full = 0;
+    d_hf_offsets[0]          = 0;
+    d_full_offsets[0]        = 0;
+    d_tile_offsets_global[0] = 0;
+    d_tile_offsets_global[1] = 0;
+
+    for (int i = 0; i < num_global_tiles; ++i) {
+        const int hf = d_gt_hf_count[i];
+        const int fl = d_gt_full_count[i];
+        d_hf_offsets[i + 1]   = d_hf_offsets[i]   + hf;
+        d_full_offsets[i + 1] = d_full_offsets[i]  + fl;
+        d_tile_offsets_global[(i + 1) * 2]     = d_hf_offsets[i + 1];
+        d_tile_offsets_global[(i + 1) * 2 + 1] = d_full_offsets[i + 1];
+        if (hf > max_hf)   max_hf   = hf;
+        if (fl > max_full)  max_full = fl;
+    }
+
+    *d_max_hf    = max_hf;
+    *d_max_full  = max_full;
+    *d_total_hf  = d_hf_offsets[num_global_tiles];
+    *d_total_full = d_full_offsets[num_global_tiles];
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 3: Scatter from per-GT temp buffers to final contiguous arrays
+// Grid: num_global_tiles blocks.  Block: 128 threads for copy throughput.
+// ---------------------------------------------------------------------------
+__global__ void ZipServGPU_Scatter(
+    const uint8_t* __restrict__ d_temp_sm,
+    const __nv_bfloat16* __restrict__ d_temp_full,
+    const int* __restrict__ d_gt_hf_count,
+    const int* __restrict__ d_gt_full_count,
+    const int* __restrict__ d_hf_offsets,
+    const int* __restrict__ d_full_offsets,
+    uint8_t* __restrict__ d_sign_mantissa,
+    __nv_bfloat16* __restrict__ d_compressed_full,
+    int num_global_tiles)
+{
+    const int MAX_SM_PER_GT   = 4096 + 15;
+    const int MAX_FULL_PER_GT = 4096 + 7;
+
+    const int gt = blockIdx.x;
+    if (gt >= num_global_tiles) return;
+
+    const int hf_count   = d_gt_hf_count[gt];
+    const int full_count = d_gt_full_count[gt];
+    const int hf_dst     = d_hf_offsets[gt];
+    const int full_dst   = d_full_offsets[gt];
+
+    const uint8_t*       src_sm   = d_temp_sm   + static_cast<size_t>(gt) * MAX_SM_PER_GT;
+    const __nv_bfloat16* src_full = d_temp_full + static_cast<size_t>(gt) * MAX_FULL_PER_GT;
+
+    for (int i = threadIdx.x; i < hf_count; i += blockDim.x) {
+        d_sign_mantissa[hf_dst + i] = src_sm[i];
+    }
+    for (int i = threadIdx.x; i < full_count; i += blockDim.x) {
+        d_compressed_full[full_dst + i] = src_full[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// API wrapper: InitBF16MatrixTripleBitmap_GPU
+// Launches 3 kernels on the given stream.  M and K must be multiples of 64.
+// All pointer parameters must point to device memory.
+// ---------------------------------------------------------------------------
+cudaError_t InitBF16MatrixTripleBitmap_GPU(
+    cudaStream_t stream,
+    const __nv_bfloat16* d_input,
+    int M, int K,
+    const int* d_top_exponents,
+    uint8_t* d_sign_mantissa,
+    __nv_bfloat16* d_compressed_full,
+    uint64_t* d_bitmap1,
+    uint64_t* d_bitmap2,
+    uint64_t* d_bitmap3,
+    int* d_tile_offsets,
+    int* d_tile_offsets_median,
+    int* d_tile_offsets_global,
+    uint8_t* d_temp_sm,
+    __nv_bfloat16* d_temp_full,
+    int* d_gt_hf_count,
+    int* d_gt_full_count,
+    int* d_hf_offsets,
+    int* d_full_offsets,
+    int* d_max_hf_count,
+    int* d_max_full_count,
+    int* d_total_hf,
+    int* d_total_full)
+{
+    InitZipServGPUTilePos();
+
+    const int num_gt = (M / 64) * (K / 64);
+    if (num_gt <= 0) return cudaErrorInvalidValue;
+
+    // Kernel 1: classify + bitmap + local compaction
+    ZipServGPU_ClassifyAndCompact<<<num_gt, 64, 0, stream>>>(
+        d_input, M, K, d_top_exponents,
+        d_bitmap1, d_bitmap2, d_bitmap3,
+        d_tile_offsets, d_tile_offsets_median,
+        d_temp_sm, d_temp_full,
+        d_gt_hf_count, d_gt_full_count);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return err;
+    }
+
+    // Kernel 2: global prefix sum + max
+    ZipServGPU_PrefixSumAndMax<<<1, 1, 0, stream>>>(
+        d_gt_hf_count, d_gt_full_count,
+        d_tile_offsets_global,
+        d_hf_offsets, d_full_offsets,
+        d_max_hf_count, d_max_full_count,
+        d_total_hf, d_total_full,
+        num_gt);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return err;
+    }
+
+    // Kernel 3: scatter to final arrays
+    ZipServGPU_Scatter<<<num_gt, 128, 0, stream>>>(
+        d_temp_sm, d_temp_full,
+        d_gt_hf_count, d_gt_full_count,
+        d_hf_offsets, d_full_offsets,
+        d_sign_mantissa, d_compressed_full,
+        num_gt);
+
+    return cudaGetLastError();
+}

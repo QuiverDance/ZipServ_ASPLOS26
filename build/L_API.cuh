@@ -141,3 +141,26 @@ __host__ int InitBF16MatrixTripleBitmap_Reuse_SIMD(
     int& out_total_hf,
     int& out_total_full);
 
+// GPU version of InitBF16MatrixTripleBitmap_Reuse
+// All pointer params are device pointers. Launches 3 kernels on the given stream.
+cudaError_t InitBF16MatrixTripleBitmap_GPU(
+    cudaStream_t stream,
+    const __nv_bfloat16* d_input,   // [M x K] device memory
+    int M, int K,
+    const int* d_top_exponents,     // [7] device memory
+    // Pre-allocated device output buffers
+    uint8_t* d_sign_mantissa,
+    __nv_bfloat16* d_compressed_full,
+    uint64_t* d_bitmap1, uint64_t* d_bitmap2, uint64_t* d_bitmap3,
+    int* d_tile_offsets,
+    int* d_tile_offsets_median,
+    int* d_tile_offsets_global,
+    // Pre-allocated device temp workspace
+    uint8_t* d_temp_sm,
+    __nv_bfloat16* d_temp_full,
+    int* d_gt_hf_count, int* d_gt_full_count,
+    int* d_hf_offsets, int* d_full_offsets,
+    // Device scalar outputs
+    int* d_max_hf_count, int* d_max_full_count,
+    int* d_total_hf, int* d_total_full);
+
