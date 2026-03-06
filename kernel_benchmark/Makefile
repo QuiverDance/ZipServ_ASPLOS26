@@ -56,7 +56,7 @@ ALL_CCFLAGS += --use_fast_math
 ALL_CCFLAGS += --ptxas-options=-v,-warn-lmem-usage,--warn-on-spills
 ################################################################################
 # Target rules
-all: test_mm test_decompress bench_llama31_70b_compress bench_zipserv_gemm_sweep bench_llama31_70b_zipserv_vs_bitcomp_compress bench_kv_cache_zipserv_compress bench_kv_cache_zipserv_compress_scaling
+all: test_mm test_decompress bench_llama31_70b_compress bench_zipserv_gemm_sweep bench_llama31_70b_zipserv_vs_bitcomp_compress bench_kv_cache_zipserv_compress bench_kv_cache_zipserv_compress_scaling bench_kv_cache_zipserv_compress_token_scaling bench_kv_cache_zipserv_decompress_token_scaling
 
 test_mm.o:  test_mm.cu utils.h 
 	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
@@ -100,6 +100,18 @@ bench_kv_cache_zipserv_compress_scaling.o: bench_kv_cache_zipserv_compress_scali
 bench_kv_cache_zipserv_compress_scaling: bench_kv_cache_zipserv_compress_scaling.o
 	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
 
+bench_kv_cache_zipserv_compress_token_scaling.o: bench_kv_cache_zipserv_compress_token_scaling.cu utils.h
+	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
+bench_kv_cache_zipserv_compress_token_scaling: bench_kv_cache_zipserv_compress_token_scaling.o
+	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+
+bench_kv_cache_zipserv_decompress_token_scaling.o: bench_kv_cache_zipserv_decompress_token_scaling.cu utils.h
+	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
+bench_kv_cache_zipserv_decompress_token_scaling: bench_kv_cache_zipserv_decompress_token_scaling.o
+	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+
 clean:
 	rm -f test_mm test_mm.o \
 		test_decompress test_decompress.o \
@@ -108,4 +120,6 @@ clean:
 		bench_zipserv_gemm_sweep bench_zipserv_gemm_sweep.o \
 		bench_llama31_70b_zipserv_vs_bitcomp_compress bench_llama31_70b_zipserv_vs_bitcomp_compress.o \
 		bench_kv_cache_zipserv_compress bench_kv_cache_zipserv_compress.o \
-		bench_kv_cache_zipserv_compress_scaling bench_kv_cache_zipserv_compress_scaling.o
+		bench_kv_cache_zipserv_compress_scaling bench_kv_cache_zipserv_compress_scaling.o \
+		bench_kv_cache_zipserv_compress_token_scaling bench_kv_cache_zipserv_compress_token_scaling.o \
+		bench_kv_cache_zipserv_decompress_token_scaling bench_kv_cache_zipserv_decompress_token_scaling.o
