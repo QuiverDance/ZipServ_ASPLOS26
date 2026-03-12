@@ -2,16 +2,17 @@
 
 import argparse
 import csv
+import importlib.util
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.cpp_extension import load
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -20,6 +21,10 @@ DEFAULT_MODEL_ROOT = Path("/home/pjw7200/models/llama31_70b")
 DEFAULT_KV_DIR = Path("/home/pjw7200/saved_kv_cache")
 DEFAULT_OUT_CSV = SCRIPT_DIR / "zipserv_decode_attention_results.csv"
 EXT_NAME = "zipserv_decode_attention_ext"
+FLASH_ATTN_EXT_NAME = "zipserv_flash_attn_ext"
+PREBUILT_EXT_ROOT = SCRIPT_DIR / ".prebuilt_extensions"
+ZIPSERV_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / EXT_NAME
+FLASH_ATTN_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / FLASH_ATTN_EXT_NAME
 
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9")
 
@@ -61,7 +66,7 @@ def parse_csv_ints(spec: str) -> List[int]:
 def print_terminal_row(row: Dict[str, object], header_state: Dict[str, bool]) -> None:
     fields = [
         ("backend", 12),
-        ("mode", 14),
+        ("mode", 18),
         ("kv_len", 8),
         ("q_heads", 8),
         ("kv_heads", 8),
@@ -93,31 +98,50 @@ def baseline_ratio(row_latency_ms: float, baseline_latency_ms: float | None) -> 
     return baseline_latency_ms / row_latency_ms
 
 
-def load_extension() -> object:
-    return load(
-        name=EXT_NAME,
-        sources=[
-            str(SCRIPT_DIR / "zipserv_decode_attention_ext.cpp"),
-            str(SCRIPT_DIR / "zipserv_decode_attention_ext.cu"),
-            str(SCRIPT_DIR / "zipserv_flashattn_decode_ext.cu"),
-        ],
-        extra_include_paths=[
-            str(REPO_ROOT / "build"),
-            str(REPO_ROOT / "csrc"),
-        ],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "--std=c++17",
-            "-lineinfo",
-        ],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_ldflags=[
-            f"-L{REPO_ROOT / 'build'}",
-            "-lL_API",
-            f"-Wl,-rpath,{REPO_ROOT / 'build'}",
-        ],
-        verbose=False,
+def ensure_extension_built(build_target: str) -> None:
+    import build_zipserv_decode_attention_extensions as ext_builder
+
+    ext_builder.ensure_extension_built(build_target)
+
+
+def load_prebuilt_extension(module_name: str, build_dir: Path, build_hint: str, build_target: str) -> object:
+    candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not candidates:
+        ensure_extension_built(build_target)
+        candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise RuntimeError(
+            f"Prebuilt extension '{module_name}' not found under {build_dir}. "
+            f"Build it first with:\n{build_hint}"
+        )
+    so_path = candidates[0]
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, so_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load extension spec from {so_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_zipserv_extension() -> object:
+    build_hint = (
+        "python build_zipserv_decode_attention_extensions.py --target zipserv"
+    )
+    return load_prebuilt_extension(EXT_NAME, ZIPSERV_EXT_BUILD_DIR, build_hint, "zipserv")
+
+
+def load_zipserv_flash_attn_extension() -> object:
+    build_hint = (
+        "python build_zipserv_decode_attention_extensions.py --target zipserv_flashattn"
+    )
+    return load_prebuilt_extension(
+        FLASH_ATTN_EXT_NAME,
+        FLASH_ATTN_EXT_BUILD_DIR,
+        build_hint,
+        "zipserv_flashattn",
     )
 
 
@@ -172,10 +196,11 @@ def build_q(weight: torch.Tensor, hidden_size: int, num_heads: int, head_dim: in
 def pad_kv_prefix(x: torch.Tensor, kv_len: int) -> Tuple[torch.Tensor, int]:
     prefix = x[:kv_len].contiguous()
     logical_rows = prefix.shape[0] * prefix.shape[1]
-    cols = prefix.shape[2]
+    logical_cols = prefix.shape[2]
     rows = ((logical_rows + 63) // 64) * 64
+    cols = ((logical_cols + 63) // 64) * 64
     out = torch.zeros((rows, cols), dtype=torch.bfloat16)
-    out[:logical_rows] = prefix.view(logical_rows, cols)
+    out[:logical_rows, :logical_cols] = prefix.view(logical_rows, logical_cols)
     return out, logical_rows
 
 
@@ -262,7 +287,7 @@ def decompress_to_kv(
     workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     dense = decompress_single_to_2d(ext, comp, output_2d=workspace)
-    return dense[: comp.logical_rows].view(kv_len, kv_heads, head_dim)
+    return dense[: comp.logical_rows, :head_dim].view(kv_len, kv_heads, head_dim)
 
 
 def availability_or_raise(backends: Iterable[str]) -> None:
@@ -272,16 +297,6 @@ def availability_or_raise(backends: Iterable[str]) -> None:
                 import flashinfer.decode  # noqa: F401
             except Exception as exc:
                 raise RuntimeError(f"flashinfer backend is unavailable: {exc}") from exc
-        elif backend == "flashattn":
-            try:
-                import flash_attn  # noqa: F401
-                from flash_attn import flash_attn_with_kvcache  # noqa: F401
-            except Exception as exc:
-                raise RuntimeError(
-                    "flash-attn backend is unavailable. Run "
-                    f"{SCRIPT_DIR / 'install_flash_attn_cuda13.sh'} "
-                    "to install the CUDA 13 toolchain pieces and build flash-attn for sm86."
-                ) from exc
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
@@ -302,24 +317,6 @@ def make_attention_runner(backend: str, q: torch.Tensor, kv_len: int) -> Callabl
                 use_tensor_cores=True,
                 sm_scale=scale,
             )
-
-        return runner
-
-    if backend == "flashattn":
-        from flash_attn import flash_attn_with_kvcache
-
-        q_in = q.view(1, 1, q.shape[0], q.shape[1]).contiguous()
-        cache_seqlens = torch.tensor([kv_len], dtype=torch.int32, device=q.device)
-
-        def runner(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            out = flash_attn_with_kvcache(
-                q_in,
-                k.view(1, k.shape[0], k.shape[1], k.shape[2]),
-                v.view(1, v.shape[0], v.shape[1], v.shape[2]),
-                cache_seqlens=cache_seqlens,
-                causal=True,
-            )
-            return out.view(q.shape[0], q.shape[1]).contiguous()
 
         return runner
 
@@ -385,6 +382,7 @@ def benchmark_one(
     runner: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     reuse_k_workspace: torch.Tensor | None = None,
     reuse_v_workspace: torch.Tensor | None = None,
+    flash_attn_ext: object | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, float | str | int]]:
     out = None
 
@@ -451,9 +449,14 @@ def benchmark_one(
 
         out, latency_ms = time_cuda(native, warmup, iters)
     elif mode == "zipserv_flashattn":
-        def zipserv_flashattn():
-            return ext.zipserv_flashattn_decode_attention(
-                q,
+        if flash_attn_ext is None:
+            raise ValueError("zipserv_flashattn mode requires the vendored flash-attn extension")
+
+        q_4d = q.view(1, 1, num_q_heads, head_dim).contiguous()
+
+        def flash_decode():
+            out_4d, _ = flash_attn_ext.fwd_kvcache_zipserv(
+                q_4d,
                 comp_k.sign_mantissa,
                 comp_k.compressed_full,
                 comp_k.bitmap1,
@@ -479,13 +482,12 @@ def benchmark_one(
                 comp_v.max_full_count,
                 comp_v.start_exp,
                 kv_len,
-                num_q_heads,
                 kv_heads,
-                head_dim,
                 1.0 / math.sqrt(float(head_dim)),
             )
+            return out_4d.squeeze(0).squeeze(0)
 
-        out, latency_ms = time_cuda(zipserv_flashattn, warmup, iters)
+        out, latency_ms = time_cuda(flash_decode, warmup, iters)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -509,7 +511,7 @@ def main() -> None:
     parser.add_argument("--model_root", type=Path, default=DEFAULT_MODEL_ROOT)
     parser.add_argument("--kv_dir", type=Path, default=DEFAULT_KV_DIR)
     parser.add_argument("--layer", type=int, default=0)
-    parser.add_argument("--backend", type=str, default="all", choices=["flashattn", "flashinfer", "all"])
+    parser.add_argument("--backend", type=str, default="all", choices=["flashinfer", "all"])
     parser.add_argument("--modes", type=str, default="dense,staged,staged_reuse")
     parser.add_argument("--token_counts", type=str, default="1,16,128,512,1024,1535")
     parser.add_argument("--warmup", type=int, default=10)
@@ -532,13 +534,14 @@ def main() -> None:
             raise ValueError(f"Unsupported mode: {mode}")
 
     if args.backend == "all":
-        requested_backends = ["flashattn", "flashinfer"]
+        requested_backends = ["flashinfer"]
     else:
         requested_backends = [args.backend]
     backends = requested_backends if any(mode in {"dense", "staged", "staged_reuse"} for mode in modes) else []
     availability_or_raise(backends)
 
-    ext = load_extension()
+    ext = load_zipserv_extension()
+    flash_attn_ext = load_zipserv_flash_attn_extension() if "zipserv_flashattn" in modes else None
     config = load_model_config(args.model_root)
     q_entry = load_manifest_entry(args.model_root, args.layer)
     q_weight = load_bf16_bin(Path(q_entry["path"]), q_entry["shape"])
@@ -659,39 +662,6 @@ def main() -> None:
                 })
                 print_terminal_row(rows[-1], header_state)
 
-        if "zipserv_flashattn" in modes:
-            flashattn_ref = dense_outputs.get("flashattn", torch_dense_reference)
-            flashattn_baseline_ms = dense_latencies.get("flashattn", torch_dense_latency_ms)
-            _, metrics = benchmark_one(
-                ext,
-                "zipserv_flashattn",
-                "zipserv_flashattn",
-                q,
-                dense_k,
-                dense_v,
-                comp_k,
-                comp_v,
-                kv_len,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                args.warmup,
-                args.iters,
-                flashattn_ref,
-            )
-            rows.append({
-                "layer": args.layer,
-                "backend": "zipserv_flashattn",
-                "mode": "zipserv_flashattn",
-                "kv_len": kv_len,
-                "q_heads": num_q_heads,
-                "kv_heads": num_kv_heads,
-                "head_dim": head_dim,
-                "base/path": baseline_ratio(float(metrics["latency_ms"]), flashattn_baseline_ms),
-                **metrics,
-            })
-            print_terminal_row(rows[-1], header_state)
-
         if "zipserv_native" in modes:
             native_ref = torch_dense_reference
             native_baseline_ms = torch_dense_latency_ms
@@ -721,6 +691,40 @@ def main() -> None:
                 "kv_heads": num_kv_heads,
                 "head_dim": head_dim,
                 "base/path": baseline_ratio(float(metrics["latency_ms"]), native_baseline_ms),
+                **metrics,
+            })
+            print_terminal_row(rows[-1], header_state)
+
+        if "zipserv_flashattn" in modes:
+            flash_ref = torch_dense_reference
+            flash_baseline_ms = torch_dense_latency_ms
+            _, metrics = benchmark_one(
+                ext,
+                "flash_attn_ck",
+                "zipserv_flashattn",
+                q,
+                dense_k,
+                dense_v,
+                comp_k,
+                comp_v,
+                kv_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                args.warmup,
+                args.iters,
+                flash_ref,
+                flash_attn_ext=flash_attn_ext,
+            )
+            rows.append({
+                "layer": args.layer,
+                "backend": "flash_attn_ck",
+                "mode": "zipserv_flashattn",
+                "kv_len": kv_len,
+                "q_heads": num_q_heads,
+                "kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "base/path": baseline_ratio(float(metrics["latency_ms"]), flash_baseline_ms),
                 **metrics,
             })
             print_terminal_row(rows[-1], header_state)
