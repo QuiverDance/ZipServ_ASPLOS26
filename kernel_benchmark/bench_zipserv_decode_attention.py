@@ -230,6 +230,18 @@ def pad_kv_prefix(x: torch.Tensor, kv_len: int) -> Tuple[torch.Tensor, int]:
     return out, logical_rows
 
 
+def pad_kv_prefix_by_kv_head(x: torch.Tensor, kv_len: int) -> Tuple[torch.Tensor, int]:
+    prefix = x[:kv_len].contiguous()
+    kv_heads = prefix.shape[1]
+    logical_cols = prefix.shape[2]
+    rows_per_head = ((kv_len + 63) // 64) * 64
+    out = torch.zeros((kv_heads * rows_per_head, ((logical_cols + 63) // 64) * 64), dtype=torch.bfloat16)
+    for kv_head in range(kv_heads):
+        row_start = kv_head * rows_per_head
+        out[row_start : row_start + kv_len, :logical_cols] = prefix[:, kv_head, :]
+    return out, kv_heads * rows_per_head
+
+
 def make_zipserv_compressed_from_parts(
     sign_mantissa: torch.Tensor,
     compressed_full: torch.Tensor,
@@ -327,6 +339,26 @@ def availability_or_raise(backends: Iterable[str]) -> None:
             raise ValueError(f"Unknown backend: {backend}")
 
 
+def load_flash_attn_with_kvcache() -> Callable[..., torch.Tensor]:
+    try:
+        from flash_attn import flash_attn_with_kvcache
+        return flash_attn_with_kvcache
+    except Exception as first_exc:
+        vendored_root = SCRIPT_DIR / "third_party" / "flash_attn_v283"
+        if vendored_root.is_dir() and str(vendored_root) not in sys.path:
+            sys.path.insert(0, str(vendored_root))
+        sys.modules.pop("flash_attn", None)
+        try:
+            from flash_attn import flash_attn_with_kvcache
+            return flash_attn_with_kvcache
+        except Exception as second_exc:
+            cause = second_exc if vendored_root.is_dir() else first_exc
+            raise RuntimeError(
+                "flash_attn staged baseline is unavailable. Install flash-attn in the active environment "
+                "or make the vendored flash_attn_v283 package importable."
+            ) from cause
+
+
 def make_attention_runner(backend: str, q: torch.Tensor, kv_len: int) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     if backend == "flashinfer":
         import flashinfer.decode
@@ -347,6 +379,23 @@ def make_attention_runner(backend: str, q: torch.Tensor, kv_len: int) -> Callabl
         return runner
 
     raise ValueError(f"Unknown backend: {backend}")
+
+
+def make_flash_attn_stage_runner(q: torch.Tensor, kv_len: int) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    flash_attn_with_kvcache = load_flash_attn_with_kvcache()
+    num_q_heads, head_dim = q.shape
+    q_4d = q.view(1, 1, num_q_heads, head_dim).contiguous()
+
+    def runner(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        out_4d = flash_attn_with_kvcache(
+            q_4d,
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            cache_seqlens=kv_len,
+        )
+        return out_4d.squeeze(0).squeeze(0)
+
+    return runner
 
 
 def dense_decode_attention(
@@ -599,6 +648,23 @@ def main() -> None:
         padded_v_cpu, _ = pad_kv_prefix(dense_v_prefix_cpu, kv_len)
         comp_k = make_zipserv_compressed(ext, padded_k_cpu.to(device=device, dtype=torch.bfloat16), logical_rows, head_dim)
         comp_v = make_zipserv_compressed(ext, padded_v_cpu.to(device=device, dtype=torch.bfloat16), logical_rows, head_dim)
+        comp_k_flash = None
+        comp_v_flash = None
+        if "zipserv_flashattn" in modes:
+            padded_k_flash_cpu, flash_logical_rows = pad_kv_prefix_by_kv_head(dense_k_prefix_cpu, kv_len)
+            padded_v_flash_cpu, _ = pad_kv_prefix_by_kv_head(dense_v_prefix_cpu, kv_len)
+            comp_k_flash = make_zipserv_compressed(
+                ext,
+                padded_k_flash_cpu.to(device=device, dtype=torch.bfloat16),
+                flash_logical_rows,
+                head_dim,
+            )
+            comp_v_flash = make_zipserv_compressed(
+                ext,
+                padded_v_flash_cpu.to(device=device, dtype=torch.bfloat16),
+                flash_logical_rows,
+                head_dim,
+            )
 
         dense_outputs: Dict[str, torch.Tensor] = {}
         dense_latencies: Dict[str, float] = {}
@@ -722,12 +788,13 @@ def main() -> None:
             print_terminal_row(rows[-1], header_state)
 
         if "zipserv_flashattn" in modes:
-            flash_ref = torch_dense_reference
-            flash_baseline_ms = torch_dense_latency_ms
-            _, metrics = benchmark_one(
+            flash_stage_runner = make_flash_attn_stage_runner(q, kv_len)
+            flash_stage_k_workspace = torch.empty((comp_k.rows, comp_k.cols), dtype=torch.bfloat16, device=q.device)
+            flash_stage_v_workspace = torch.empty((comp_v.rows, comp_v.cols), dtype=torch.bfloat16, device=q.device)
+            _, flash_stage_metrics = benchmark_one(
                 ext,
-                "flash_attn_ck",
-                "zipserv_flashattn",
+                "flash_attn",
+                "staged_reuse",
                 q,
                 dense_k,
                 dense_v,
@@ -739,7 +806,28 @@ def main() -> None:
                 head_dim,
                 args.warmup,
                 args.iters,
-                flash_ref,
+                torch_dense_reference,
+                runner=flash_stage_runner,
+                reuse_k_workspace=flash_stage_k_workspace,
+                reuse_v_workspace=flash_stage_v_workspace,
+            )
+            flash_baseline_ms = float(flash_stage_metrics["latency_ms"])
+            _, metrics = benchmark_one(
+                ext,
+                "flash_attn_ck",
+                "zipserv_flashattn",
+                q,
+                dense_k,
+                dense_v,
+                comp_k_flash,
+                comp_v_flash,
+                kv_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                args.warmup,
+                args.iters,
+                torch_dense_reference,
                 flash_attn_ext=flash_attn_ext,
             )
             rows.append({

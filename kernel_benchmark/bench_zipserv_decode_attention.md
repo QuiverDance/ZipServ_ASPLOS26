@@ -5,7 +5,7 @@
 - real Llama 3.1 70B `q_proj.weight`
 - KV cache from `~/saved_kv_cache`
 - token-length sweep over `kv_len`
-- backend: `flashinfer` baseline plus vendored `flash_attn_ck` for `zipserv_flashattn`
+- backend: `flashinfer` baseline for staged paths plus staged `flash_attn` baseline for `zipserv_flashattn`
 - modes: `dense`, `staged`, `staged_reuse`, `zipserv_native`, `zipserv_flashattn`
 
 ## Environment
@@ -19,6 +19,7 @@ Required:
 
 Optional for external fused baselines:
 
+- `flash-attn`
 - `flashinfer-python`
 - vendored `flash_attn_v283` source tree under `kernel_benchmark/third_party`
 
@@ -98,7 +99,7 @@ python bench_zipserv_decode_attention.py \
 - `zipserv_native`: compressed K/V를 shared memory로 가져와 score 계산, row softmax, value accumulation을 수행하는 ZipServ 전용 decode-attention 경로. dense K/V materialization이 없다.
 - `zipserv_flashattn`: vendored `flash_attn_ck` 쪽 standalone fused decode kernel이 ZipServ compressed K/V를 직접 읽는 경로. compressed global tile load -> shared-memory decompress -> online softmax -> V accumulation 순서로 처리하며 dense K/V materialization이 없다.
 - `zipserv_native`는 내부적으로 dense torch reference를 baseline으로 사용해 `base/path`, `max_abs_err`, `mean_abs_err`를 계산한다.
-- `zipserv_flashattn`도 동일한 dense torch reference 기준으로 `base/path`, `max_abs_err`, `mean_abs_err`를 기록한다.
+- `zipserv_flashattn`는 내부적으로 측정한 `staged_reuse + flash_attn` latency를 `base/path` 기준으로만 사용하고, `max_abs_err`, `mean_abs_err`는 기존처럼 dense torch reference 기준으로 기록한다.
 - 현재 `zipserv_native` 제약:
   `num_kv_heads == 8`
   `head_dim <= 256`
