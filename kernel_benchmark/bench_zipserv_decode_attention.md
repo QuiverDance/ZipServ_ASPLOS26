@@ -5,8 +5,8 @@
 - real Llama 3.1 70B `q_proj.weight`
 - KV cache from `~/saved_kv_cache`
 - token-length sweep over `kv_len`
-- backends: `flashinfer`, `flash-attn`, `zipserv_native`
-- modes: `dense`, `staged`, `staged_reuse`, `zipserv_native`
+- backend: `flashinfer` baseline plus vendored `flash_attn_ck` for `zipserv_flashattn`
+- modes: `dense`, `staged`, `staged_reuse`, `zipserv_native`, `zipserv_flashattn`
 
 ## Environment
 
@@ -20,7 +20,7 @@ Required:
 Optional for external fused baselines:
 
 - `flashinfer-python`
-- `flash-attn`
+- vendored `flash_attn_v283` source tree under `kernel_benchmark/third_party`
 
 Current working environment:
 
@@ -31,6 +31,15 @@ Current working environment:
 - `flashinfer-python`: `0.6.5`
 
 ## Run
+Optional prebuild step (`sm_86` only):
+
+```bash
+source ~/ls/etc/profile.d/conda.sh
+conda activate zipserv
+cd ~/ZipServ_ASPLOS26/kernel_benchmark
+TORCH_CUDA_ARCH_LIST=8.6 python build_zipserv_decode_attention_extensions.py --target all --verbose
+```
+
 `zipserv_native` only:
 
 ```bash
@@ -46,7 +55,7 @@ python bench_zipserv_decode_attention.py \
   --out_csv zipserv_decode_attention_native.csv
 ```
 
-`flashinfer` / `flash-attn` 비교 경로:
+`flashinfer` staged baseline:
 
 ```bash
 source ~/ls/etc/profile.d/conda.sh
@@ -62,7 +71,7 @@ python bench_zipserv_decode_attention.py \
   --out_csv zipserv_decode_attention_flashinfer.csv
 ```
 
-`flash-attn` run:
+vendored fused `flash_attn_ck` path:
 
 ```bash
 source ~/ls/etc/profile.d/conda.sh
@@ -70,9 +79,8 @@ conda activate zipserv
 cd ~/ZipServ_ASPLOS26/kernel_benchmark
 python bench_zipserv_decode_attention.py \
   --layer 0 \
-  --backend flashattn \
-  --modes dense,staged,staged_reuse \
-  --token_counts 1,16,128,512,1024,1535 \
+  --modes zipserv_flashattn \
+  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
   --warmup 10 \
   --iters 100 \
   --out_csv zipserv_decode_attention_flashattn.csv
@@ -88,10 +96,18 @@ python bench_zipserv_decode_attention.py \
 - `staged`: 매 iteration마다 ZipServ K/V를 새 dense buffer로 decompress한 뒤 attention backend에 넣는 경로
 - `staged_reuse`: `staged`와 동일하지만 dense K/V output buffer를 재사용해서 per-iteration allocation overhead를 제거한 경로
 - `zipserv_native`: compressed K/V를 shared memory로 가져와 score 계산, row softmax, value accumulation을 수행하는 ZipServ 전용 decode-attention 경로. dense K/V materialization이 없다.
+- `zipserv_flashattn`: vendored `flash_attn_ck` 쪽 standalone fused decode kernel이 ZipServ compressed K/V를 직접 읽는 경로. compressed global tile load -> shared-memory decompress -> online softmax -> V accumulation 순서로 처리하며 dense K/V materialization이 없다.
 - `zipserv_native`는 내부적으로 dense torch reference를 baseline으로 사용해 `base/path`, `max_abs_err`, `mean_abs_err`를 계산한다.
+- `zipserv_flashattn`도 동일한 dense torch reference 기준으로 `base/path`, `max_abs_err`, `mean_abs_err`를 기록한다.
 - 현재 `zipserv_native` 제약:
   `num_kv_heads == 8`
   `head_dim <= 256`
+- 현재 `zipserv_flashattn` 제약:
+  `bf16` only
+  `batch_size == 1`
+  `q_len == 1`
+  `num_kv_heads == 8`
+  `head_dim <= 256`
 - CSV time metric is only `latency_ms`; staged component timings and compression-ratio metrics are intentionally omitted
-- first run may spend extra time compiling/loading the local CUDA extension
-- verified smoke runs completed for `zipserv_native` (`kv_len=1`) and for the existing `flashinfer` / `flash-attn` paths on this machine
+- first run may spend extra time compiling/loading the local CUDA extensions; the local defaults now target `TORCH_CUDA_ARCH_LIST=8.6`
+- verified smoke runs completed for `zipserv_native` and `zipserv_flashattn` with `kv_len=1,16` on this machine

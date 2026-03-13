@@ -1,0 +1,4 @@
+# ninja log v7
+1	26279	1773371196728959085	zipserv_decode_attention_ext.o	eb768a5bdba1a31f
+1	65083	1773371196728959085	zipserv_decode_attention_ext.cuda.o	6e1ab7f21dbe0ca1
+65096	65445	1773371261821096057	zipserv_decode_attention_ext.so	7e71b08c8067d6ba

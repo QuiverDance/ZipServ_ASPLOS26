@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from torch.utils.cpp_extension import load
@@ -11,12 +12,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 EXT_NAME = "zipserv_decode_attention_ext"
 FLASH_ATTN_EXT_NAME = "zipserv_flash_attn_ext"
-PREBUILT_EXT_ROOT = SCRIPT_DIR / ".prebuilt_extensions"
+PYTHON_ABI_TAG = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"
+PREBUILT_EXT_ROOT = SCRIPT_DIR / ".prebuilt_extensions" / PYTHON_ABI_TAG
 ZIPSERV_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / EXT_NAME
 FLASH_ATTN_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / FLASH_ATTN_EXT_NAME
 FLASH_ATTN_ROOT = SCRIPT_DIR / "third_party" / "flash_attn_v283"
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
 
 
 def newest_shared_object(build_dir: Path, module_name: str) -> Path | None:
@@ -98,6 +100,7 @@ def main() -> None:
     args = parser.parse_args()
 
     PREBUILT_EXT_ROOT.mkdir(parents=True, exist_ok=True)
+    print(f"PYTHON_ABI_TAG={PYTHON_ABI_TAG}")
     print(f"TORCH_CUDA_ARCH_LIST={os.environ.get('TORCH_CUDA_ARCH_LIST', '<unset>')}")
     print(f"MAX_JOBS={os.environ.get('MAX_JOBS', '<unset>')}")
 

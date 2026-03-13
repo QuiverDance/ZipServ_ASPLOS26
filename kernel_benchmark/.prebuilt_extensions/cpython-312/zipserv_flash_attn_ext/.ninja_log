@@ -1,0 +1,4 @@
+# ninja log v7
+0	18833	1773371655857948129	zipserv_flash_api.o	54f0cc213aae1522
+1	49109	1773371655857948129	zipserv_fwd_kvcache.cuda.o	a4cfebdca2ec21ac
+49123	49493	1773371704982056337	zipserv_flash_attn_ext.so	81f645d4ea07da50

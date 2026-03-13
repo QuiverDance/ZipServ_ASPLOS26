@@ -22,11 +22,12 @@ DEFAULT_KV_DIR = Path("/home/pjw7200/saved_kv_cache")
 DEFAULT_OUT_CSV = SCRIPT_DIR / "zipserv_decode_attention_results.csv"
 EXT_NAME = "zipserv_decode_attention_ext"
 FLASH_ATTN_EXT_NAME = "zipserv_flash_attn_ext"
-PREBUILT_EXT_ROOT = SCRIPT_DIR / ".prebuilt_extensions"
+PYTHON_ABI_TAG = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"
+PREBUILT_EXT_ROOT = SCRIPT_DIR / ".prebuilt_extensions" / PYTHON_ABI_TAG
 ZIPSERV_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / EXT_NAME
 FLASH_ATTN_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / FLASH_ATTN_EXT_NAME
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
 
 
 @dataclass
@@ -105,6 +106,20 @@ def ensure_extension_built(build_target: str) -> None:
 
 
 def load_prebuilt_extension(module_name: str, build_dir: Path, build_hint: str, build_target: str) -> object:
+    def import_module_from_path(so_path: Path) -> object:
+        sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(module_name, so_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load extension spec from {so_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        return module
+
     candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not candidates:
         ensure_extension_built(build_target)
@@ -117,13 +132,24 @@ def load_prebuilt_extension(module_name: str, build_dir: Path, build_hint: str, 
     so_path = candidates[0]
     if module_name in sys.modules:
         return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(module_name, so_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load extension spec from {so_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    try:
+        return import_module_from_path(so_path)
+    except Exception as first_exc:
+        ensure_extension_built(build_target)
+        candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise RuntimeError(
+                f"Prebuilt extension '{module_name}' could not be rebuilt under {build_dir}. "
+                f"Build it first with:\n{build_hint}"
+            ) from first_exc
+        try:
+            return import_module_from_path(candidates[0])
+        except Exception as second_exc:
+            raise RuntimeError(
+                f"Failed to load extension '{module_name}' from {candidates[0]}.\n"
+                f"First load error: {first_exc}\n"
+                f"After rebuild: {second_exc}"
+            ) from second_exc
 
 
 def load_zipserv_extension() -> object:

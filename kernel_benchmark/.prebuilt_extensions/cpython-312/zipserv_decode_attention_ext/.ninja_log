@@ -1,0 +1,4 @@
+# ninja log v7
+0	26640	1773371590453804603	zipserv_decode_attention_ext.o	3e0c0097e3f21c06
+1	65018	1773371590453804603	zipserv_decode_attention_ext.cuda.o	6219c2b00dd82f41
+65029	65395	1773371655481947303	zipserv_decode_attention_ext.so	30a44f41bc8eb741
