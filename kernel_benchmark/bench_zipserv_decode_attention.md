@@ -5,8 +5,8 @@
 - real Llama 3.1 70B `q_proj.weight`
 - KV cache from `~/saved_kv_cache`
 - token-length sweep over `kv_len`
-- backend: `flashinfer` baseline for staged paths plus staged `flash_attn` baseline for ZipServ FlashAttention variants
-- modes: `dense`, `staged`, `staged_reuse`, `zipserv_native`, `zipserv_flashattn`, `zipserv_flashattn_paged`, `zipserv_flashattn_fused`
+- backend: `flashinfer` baseline for staged paths plus direct/staged `flash_attn` baselines for ZipServ FlashAttention variants
+- modes: `dense`, `dense_flashattn`, `staged`, `staged_reuse`, `zipserv_native`, `zipserv_flashattn`, `zipserv_flashattn_paged`, `zipserv_flashattn_fused`
 
 ## Environment
 
@@ -72,6 +72,21 @@ python bench_zipserv_decode_attention.py \
   --out_csv zipserv_decode_attention_flashinfer.csv
 ```
 
+direct dense `flash_attn` baseline:
+
+```bash
+source ~/ls/etc/profile.d/conda.sh
+conda activate zipserv
+cd ~/ZipServ_ASPLOS26/kernel_benchmark
+python bench_zipserv_decode_attention.py \
+  --layer 0 \
+  --modes dense_flashattn \
+  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
+  --warmup 10 \
+  --iters 100 \
+  --out_csv zipserv_decode_attention_dense_flashattn.csv
+```
+
 `zipserv_flashattn` hybrid FlashAttention path:
 
 ```bash
@@ -124,6 +139,7 @@ python bench_zipserv_decode_attention.py \
 - `K/V` come from the sorted KV cache pair `2 * layer`, `2 * layer + 1`
 - ZipServ compression is performed offline before timing
 - `dense`: already-materialized dense K/V on GPU를 그대로 attention backend에 넣는 경로
+- `dense_flashattn`: already-materialized dense K/V on GPU를 그대로 `flash_attn_with_kvcache`에 넣는 direct FlashAttention baseline 경로
 - `staged`: 매 iteration마다 ZipServ K/V를 새 dense buffer로 decompress한 뒤 attention backend에 넣는 경로
 - `staged_reuse`: `staged`와 동일하지만 dense K/V output buffer를 재사용해서 per-iteration allocation overhead를 제거한 경로
 - `zipserv_native`: compressed K/V를 shared memory로 가져와 score 계산, row softmax, value accumulation을 수행하는 ZipServ 전용 decode-attention 경로. dense K/V materialization이 없다.
@@ -135,6 +151,8 @@ python bench_zipserv_decode_attention.py \
 - 현재 `zipserv_native` 제약:
   `num_kv_heads == 8`
   `head_dim <= 256`
+- 현재 `dense_flashattn` 제약:
+  `flash-attn` import 가능
 - 현재 `zipserv_flashattn` 제약:
   `flash-attn` import 가능
   short-range hybrid에서 fused 경로를 쓰려면 `num_kv_heads == 8`

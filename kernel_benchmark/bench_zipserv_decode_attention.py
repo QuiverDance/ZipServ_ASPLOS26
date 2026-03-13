@@ -28,6 +28,7 @@ ZIPSERV_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / EXT_NAME
 FLASH_ATTN_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / FLASH_ATTN_EXT_NAME
 FLASH_ATTN_PAGE_BLOCK_SIZE = 256
 ZIPSERV_FLASH_ATTN_POLICY_FUSED_MAX_KV_LEN = 256
+DENSE_FLASH_ATTN_MODE = "dense_flashattn"
 ZIPSERV_FLASH_ATTN_MODE = "zipserv_flashattn"
 ZIPSERV_FLASH_ATTN_PAGED_MODE = "zipserv_flashattn_paged"
 ZIPSERV_FLASH_ATTN_FUSED_MODE = "zipserv_flashattn_fused"
@@ -711,6 +712,7 @@ def main() -> None:
     token_counts = parse_csv_ints(args.token_counts)
     supported_modes = {
         "dense",
+        DENSE_FLASH_ATTN_MODE,
         "staged",
         "staged_reuse",
         "zipserv_native",
@@ -818,7 +820,16 @@ def main() -> None:
         dense_latencies: Dict[str, float] = {}
         torch_dense_reference = None
         torch_dense_latency_ms = None
-        if any(mode in {"zipserv_native", ZIPSERV_FLASH_ATTN_MODE, ZIPSERV_FLASH_ATTN_PAGED_MODE, ZIPSERV_FLASH_ATTN_FUSED_MODE} for mode in modes):
+        if any(
+            mode in {
+                DENSE_FLASH_ATTN_MODE,
+                "zipserv_native",
+                ZIPSERV_FLASH_ATTN_MODE,
+                ZIPSERV_FLASH_ATTN_PAGED_MODE,
+                ZIPSERV_FLASH_ATTN_FUSED_MODE,
+            }
+            for mode in modes
+        ):
             torch_dense_reference, torch_dense_latency_ms = time_cuda(
                 lambda: dense_decode_attention(q, dense_k, dense_v, num_q_heads, num_kv_heads),
                 args.warmup,
@@ -931,6 +942,39 @@ def main() -> None:
                 "kv_heads": num_kv_heads,
                 "head_dim": head_dim,
                 "base/path": baseline_ratio(float(metrics["latency_ms"]), native_baseline_ms),
+                **metrics,
+            })
+            print_terminal_row(rows[-1], header_state)
+
+        if DENSE_FLASH_ATTN_MODE in modes:
+            flash_dense_runner = make_flash_attn_stage_runner(q, kv_len)
+            _, metrics = benchmark_one(
+                ext,
+                "flash_attn",
+                "dense",
+                q,
+                dense_k,
+                dense_v,
+                comp_k,
+                comp_v,
+                kv_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                args.warmup,
+                args.iters,
+                torch_dense_reference,
+                runner=flash_dense_runner,
+            )
+            rows.append({
+                "layer": args.layer,
+                "backend": "flash_attn",
+                "mode": DENSE_FLASH_ATTN_MODE,
+                "kv_len": kv_len,
+                "q_heads": num_q_heads,
+                "kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "base/path": 1.0,
                 **metrics,
             })
             print_terminal_row(rows[-1], header_state)
