@@ -1,12 +1,10 @@
 # bench_zipserv_decode_attention
 
-`bench_zipserv_decode_attention.py` benchmarks GPU-only decode attention for a single layer using:
+`bench_zipserv_decode_attention.py` now runs a batch-size sweep only.
 
-- real Llama 3.1 70B `q_proj.weight`
-- KV cache from `~/saved_kv_cache`
-- token-length sweep over `kv_len`
-- backend: `flashinfer` baseline for staged paths plus direct/staged `flash_attn` baselines for ZipServ FlashAttention variants
-- modes: `dense`, `dense_flashattn`, `staged`, `staged_reuse`, `zipserv_native`, `zipserv_flashattn`, `zipserv_flashattn_paged`, `zipserv_flashattn_fused`
+- `kv_len` is fixed to `1020`
+- supported modes are only `flashattn`, `flashinfer`, `staged_flashattn`, `staged_flashinfer`, `fused_flashattn`
+- output rows vary by `batch_size`
 
 ## Environment
 
@@ -16,23 +14,15 @@ Required:
 
 - `torch` with CUDA
 - `libL_API.so` built under `~/ZipServ_ASPLOS26/build`
+- prebuilt `zipserv` extension from `build_zipserv_decode_attention_extensions.py --target zipserv`
 
-Optional for external fused baselines:
+Optional:
 
 - `flash-attn`
 - `flashinfer-python`
-- vendored `flash_attn_v283` source tree under `kernel_benchmark/third_party`
+- vendored `flash_attn_v283` source tree under `kernel_benchmark/third_party` for `fused_flashattn`
 
-Current working environment:
-
-- conda env: `zipserv`
-- Python: `3.12`
-- `torch`: `2.9.1+cu128`
-- `flash-attn`: `2.8.3`
-- `flashinfer-python`: `0.6.5`
-
-## Run
-Optional prebuild step (`sm_86` only):
+## Build
 
 ```bash
 source ~/ls/etc/profile.d/conda.sh
@@ -41,7 +31,9 @@ cd ~/ZipServ_ASPLOS26/kernel_benchmark
 TORCH_CUDA_ARCH_LIST=8.6 python build_zipserv_decode_attention_extensions.py --target all --verbose
 ```
 
-`zipserv_native` only:
+## Run
+
+All five modes together:
 
 ```bash
 source ~/ls/etc/profile.d/conda.sh
@@ -49,14 +41,14 @@ conda activate zipserv
 cd ~/ZipServ_ASPLOS26/kernel_benchmark
 python bench_zipserv_decode_attention.py \
   --layer 0 \
-  --modes zipserv_native \
-  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
+  --modes flashattn,flashinfer,staged_flashattn,staged_flashinfer,fused_flashattn \
+  --batch_sizes 1,2,4,8,16,32,64,128,256,512 \
   --warmup 10 \
   --iters 100 \
-  --out_csv zipserv_decode_attention_native.csv
+  --out_csv zipserv_decode_attention_batch_sweep.csv
 ```
 
-`flashinfer` staged baseline:
+`fused_flashattn` only:
 
 ```bash
 source ~/ls/etc/profile.d/conda.sh
@@ -64,108 +56,29 @@ conda activate zipserv
 cd ~/ZipServ_ASPLOS26/kernel_benchmark
 python bench_zipserv_decode_attention.py \
   --layer 0 \
-  --backend all \
-  --modes staged_reuse \
-  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
+  --modes fused_flashattn \
+  --batch_sizes 1,2,4,8,16,32,64,128,256,512 \
   --warmup 10 \
   --iters 100 \
-  --out_csv zipserv_decode_attention_flashinfer.csv
+  --out_csv zipserv_decode_attention_fused_flashattn.csv
 ```
 
-direct dense `flash_attn` baseline:
+## Modes
 
-```bash
-source ~/ls/etc/profile.d/conda.sh
-conda activate zipserv
-cd ~/ZipServ_ASPLOS26/kernel_benchmark
-python bench_zipserv_decode_attention.py \
-  --layer 0 \
-  --modes dense_flashattn \
-  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
-  --warmup 10 \
-  --iters 100 \
-  --out_csv zipserv_decode_attention_dense_flashattn.csv
-```
-
-`zipserv_flashattn` hybrid FlashAttention path:
-
-```bash
-source ~/ls/etc/profile.d/conda.sh
-conda activate zipserv
-cd ~/ZipServ_ASPLOS26/kernel_benchmark
-python bench_zipserv_decode_attention.py \
-  --layer 0 \
-  --modes zipserv_flashattn \
-  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
-  --warmup 10 \
-  --iters 100 \
-  --out_csv zipserv_decode_attention_flashattn.csv
-```
-
-explicit paged FlashAttention handoff path:
-
-```bash
-source ~/ls/etc/profile.d/conda.sh
-conda activate zipserv
-cd ~/ZipServ_ASPLOS26/kernel_benchmark
-python bench_zipserv_decode_attention.py \
-  --layer 0 \
-  --modes zipserv_flashattn_paged \
-  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
-  --warmup 10 \
-  --iters 100 \
-  --out_csv zipserv_decode_attention_flashattn_paged.csv
-```
-
-legacy vendored fused `flash_attn_ck` path:
-
-```bash
-source ~/ls/etc/profile.d/conda.sh
-conda activate zipserv
-cd ~/ZipServ_ASPLOS26/kernel_benchmark
-python bench_zipserv_decode_attention.py \
-  --layer 0 \
-  --modes zipserv_flashattn_fused \
-  --token_counts 1,2,4,8,16,32,64,128,256,512,1024,1535 \
-  --warmup 10 \
-  --iters 100 \
-  --out_csv zipserv_decode_attention_flashattn_fused.csv
-```
+- `flashattn`: dense K/V를 그대로 stock `flash_attn_with_kvcache`에 넣는 baseline
+- `flashinfer`: dense K/V를 FlashInfer paged-KV cache로 materialize한 뒤 batch decode wrapper로 실행하는 baseline
+- `staged_flashattn`: ZipServ compressed K/V를 매 iteration마다 reusable dense workspace로 decompress한 뒤 `flash_attn_with_kvcache`에 넣는 경로
+- `staged_flashinfer`: ZipServ compressed K/V를 매 iteration마다 reusable paged-KV workspace로 decompress한 뒤 FlashInfer batch decode wrapper에 넣는 경로
+- `fused_flashattn`: 수정된 원본 FlashAttention 경로로 직접 들어가 `zipserv_k`, `zipserv_v`, `zipserv_num_heads_k` metadata를 넘겨 split-kv tile load 시점에만 decompress하는 경로
 
 ## Notes
 
 - decode-only workload: `q_len = 1`
-- `Q` is generated from the real `q_proj.weight` and a deterministic synthetic hidden state
+- `Q` is generated from the real Llama 3.1 70B `q_proj.weight`
 - `K/V` come from the sorted KV cache pair `2 * layer`, `2 * layer + 1`
-- ZipServ compression is performed offline before timing
-- `dense`: already-materialized dense K/V on GPU를 그대로 attention backend에 넣는 경로
-- `dense_flashattn`: already-materialized dense K/V on GPU를 그대로 `flash_attn_with_kvcache`에 넣는 direct FlashAttention baseline 경로
-- `staged`: 매 iteration마다 ZipServ K/V를 새 dense buffer로 decompress한 뒤 attention backend에 넣는 경로
-- `staged_reuse`: `staged`와 동일하지만 dense K/V output buffer를 재사용해서 per-iteration allocation overhead를 제거한 경로
-- `zipserv_native`: compressed K/V를 shared memory로 가져와 score 계산, row softmax, value accumulation을 수행하는 ZipServ 전용 decode-attention 경로. dense K/V materialization이 없다.
-- `zipserv_flashattn`: 기본 hybrid 정책 경로. 현재 측정 기준으로 `kv_len <= 256`에서는 vendored fused `flash_attn_ck` 경로를 사용하고, `kv_len > 256`에서는 paged-KV handoff 경로를 사용한다.
-- `zipserv_flashattn_paged`: ZipServ K/V를 FlashAttention paged-KV layout에 맞는 dense reusable workspace로 decompress한 뒤 `flash_attn_with_kvcache(..., block_table=...)`로 handoff하는 명시적 paged 경로다.
-- `zipserv_flashattn_fused`: vendored `flash_attn_ck` 쪽 standalone fused decode kernel이 ZipServ compressed K/V를 직접 읽는 legacy 경로. compressed global tile load -> shared-memory decompress -> online softmax -> V accumulation 순서로 처리하며 dense K/V materialization이 없다.
-- `zipserv_native`는 내부적으로 dense torch reference를 baseline으로 사용해 `base/path`, `max_abs_err`, `mean_abs_err`를 계산한다.
-- `zipserv_flashattn`, `zipserv_flashattn_paged`, `zipserv_flashattn_fused`는 내부적으로 측정한 `staged_reuse + flash_attn` latency를 `base/path` 기준으로 사용하고, `max_abs_err`, `mean_abs_err`는 기존처럼 dense torch reference 기준으로 기록한다.
-- 현재 `zipserv_native` 제약:
-  `num_kv_heads == 8`
-  `head_dim <= 256`
-- 현재 `dense_flashattn` 제약:
-  `flash-attn` import 가능
-- 현재 `zipserv_flashattn` 제약:
-  `flash-attn` import 가능
-  short-range hybrid에서 fused 경로를 쓰려면 `num_kv_heads == 8`
-  paged fallback은 block size `256`
-- 현재 `zipserv_flashattn_paged` 제약:
-  `flash-attn` import 가능
-  paged KV block size `256`
-- 현재 `zipserv_flashattn_fused` 제약:
-  `bf16` only
-  `batch_size == 1`
-  `q_len == 1`
-  `num_kv_heads == 8`
-  `head_dim <= 256`
-- CSV time metric is only `latency_ms`; staged component timings and compression-ratio metrics are intentionally omitted
-- first run may spend extra time compiling/loading the local CUDA extensions; the local defaults now target `TORCH_CUDA_ARCH_LIST=8.6`
-- verified smoke runs completed for `zipserv_native`, `zipserv_flashattn`, and `zipserv_flashattn_fused` on this machine
+- 출력 CSV 열은 `layer, mode, batch_size, kv_len, q_heads, kv_heads, head_dim, latency_ms, base_path, status` 이다
+- `base_path`는 `latency_ms` 대비 같은 계열의 direct baseline 비율이다
+- `flashattn`, `flashinfer`는 각자 direct baseline이므로 `base_path = 1`이다
+- `flashinfer` paths use page size `16`
+- `fused_flashattn` currently requires `num_kv_heads == 8`
+- dense torch reference는 사용하지 않는다. 정확도는 reference 제거 전에 batch `1..256`에서 사전 확인했다.
