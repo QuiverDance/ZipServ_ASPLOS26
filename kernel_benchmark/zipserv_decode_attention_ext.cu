@@ -22,6 +22,14 @@ constexpr int kTileK = 64;
 constexpr int kWarpSize = 32;
 constexpr int kThreadsPerBlock = 128;
 constexpr int kSoftmaxThreads = 256;
+constexpr int kGroupedQHeadsPerCta = 2;
+constexpr int kThreadsPerGroupedQHead = kThreadsPerBlock / kGroupedQHeadsPerCta;
+constexpr int kTokenGroupsPerGroupedQHead = kThreadsPerGroupedQHead / 16;
+constexpr int kMaxOutputAccumsPerThread = 256 / kThreadsPerGroupedQHead;
+
+static_assert(kThreadsPerBlock % kGroupedQHeadsPerCta == 0, "invalid grouped-head CTA shape");
+static_assert(kThreadsPerGroupedQHead % 16 == 0, "grouped-head CTA requires 16-thread token groups");
+static_assert(256 % kThreadsPerGroupedQHead == 0, "grouped-head CTA assumes exact head-dim coverage up to 256");
 
 #define CUDA_CHECK(expr) TORCH_CHECK((expr) == cudaSuccess, #expr " failed")
 
@@ -416,6 +424,1345 @@ __global__ void ZipservDecodeValuesKernel(
     output[q_head * head_dim + dim] = acc;
 }
 
+template <typename TilingConfig>
+__global__ void ZipservDecodeAttentionOnlineKernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_sign_mantissa,
+    const __nv_bfloat16* __restrict__ k_compressed_full,
+    const uint64_t* __restrict__ k_bitmap1,
+    const uint64_t* __restrict__ k_bitmap2,
+    const uint64_t* __restrict__ k_bitmap3,
+    const int* __restrict__ k_tile_offsets_median,
+    const int* __restrict__ k_tile_offsets_global,
+    int k_rows,
+    int k_cols,
+    int k_max_high_freq_count,
+    int k_max_full_count,
+    uint8_t k_start_exp,
+    const uint8_t* __restrict__ v_sign_mantissa,
+    const __nv_bfloat16* __restrict__ v_compressed_full,
+    const uint64_t* __restrict__ v_bitmap1,
+    const uint64_t* __restrict__ v_bitmap2,
+    const uint64_t* __restrict__ v_bitmap3,
+    const int* __restrict__ v_tile_offsets_median,
+    const int* __restrict__ v_tile_offsets_global,
+    int v_rows,
+    int v_cols,
+    int v_max_high_freq_count,
+    int v_max_full_count,
+    uint8_t v_start_exp,
+    int logical_kv_len,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float sm_scale,
+    float* __restrict__ output) {
+    const int q_head = blockIdx.x;
+    const int kv_group_size = num_q_heads / num_kv_heads;
+    const int kv_head = q_head / kv_group_size;
+    const int token_group = threadIdx.x / 16;
+    const int lane_in_group = threadIdx.x % 16;
+    const int token_stride = kTileM / num_kv_heads;
+    const int dim0 = threadIdx.x;
+    const int dim1 = threadIdx.x + kThreadsPerBlock;
+
+    extern __shared__ __align__(128) __nv_bfloat16 smem_buffer[];
+    auto* smem_output = reinterpret_cast<__nv_bfloat16(*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(smem_buffer);
+    const int bitmap_size = TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3;
+    uint64_t* smem_bitmap1 = reinterpret_cast<uint64_t*>(smem_output + 64);
+    uint64_t* smem_bitmap2 = smem_bitmap1 + bitmap_size;
+    uint64_t* smem_bitmap3 = smem_bitmap2 + bitmap_size;
+    uint8_t* smem_sign_mantissa = reinterpret_cast<uint8_t*>(smem_bitmap3 + bitmap_size);
+    const size_t shared_hf_count = static_cast<size_t>(
+        k_max_high_freq_count > v_max_high_freq_count ? k_max_high_freq_count : v_max_high_freq_count);
+    const size_t shared_full_count = static_cast<size_t>(
+        k_max_full_count > v_max_full_count ? k_max_full_count : v_max_full_count);
+    const size_t padding = (128 - (shared_hf_count % 128)) % 128;
+    __nv_bfloat16* smem_full_values =
+        reinterpret_cast<__nv_bfloat16*>(smem_sign_mantissa + shared_hf_count + padding);
+    __nv_bfloat16* smem_q_group = smem_full_values + shared_full_count;
+
+    __shared__ float tile_scores[8];
+    __shared__ float tile_weights[8];
+    __shared__ float running_max;
+    __shared__ float running_sum;
+    __shared__ float output_scale;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (threadIdx.x == 0) {
+        running_max = -FLT_MAX;
+        running_sum = 0.0f;
+        output_scale = 0.0f;
+    }
+    __syncthreads();
+
+    const int k_col_tiles = k_cols / kTileK;
+    const int v_col_tiles = v_cols / kTileK;
+    const int row_tiles = (logical_kv_len + token_stride - 1) / token_stride;
+    for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        if (threadIdx.x < token_stride) {
+            tile_scores[threadIdx.x] = 0.0f;
+            tile_weights[threadIdx.x] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int col_tile = 0; col_tile < k_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                k_sign_mantissa,
+                k_compressed_full,
+                k_bitmap1,
+                k_bitmap2,
+                k_bitmap3,
+                k_tile_offsets_median,
+                k_tile_offsets_global,
+                k_max_high_freq_count,
+                k_max_full_count,
+                k_start_exp,
+                k_rows,
+                k_cols,
+                row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            const int token = row_tile * token_stride + token_group;
+            float partial = 0.0f;
+            if (token < logical_kv_len) {
+                const int local_row = kv_head + token_group * num_kv_heads;
+                const int q_base = q_head * head_dim + col_tile * kTileK;
+                partial += __bfloat162float(q[q_base + lane_in_group]) *
+                           __bfloat162float(smem_output[local_row][lane_in_group]);
+                partial += __bfloat162float(q[q_base + lane_in_group + 16]) *
+                           __bfloat162float(smem_output[local_row][lane_in_group + 16]);
+                partial += __bfloat162float(q[q_base + lane_in_group + 32]) *
+                           __bfloat162float(smem_output[local_row][lane_in_group + 32]);
+                partial += __bfloat162float(q[q_base + lane_in_group + 48]) *
+                           __bfloat162float(smem_output[local_row][lane_in_group + 48]);
+            }
+
+            for (int offset = 8; offset > 0; offset /= 2) {
+                partial += __shfl_down_sync(0xFFFFFFFF, partial, offset, 16);
+            }
+            if (lane_in_group == 0 && token < logical_kv_len) {
+                tile_scores[token_group] += partial;
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            const int tile_token_start = row_tile * token_stride;
+            float tile_max = -FLT_MAX;
+            for (int token_in_tile = 0; token_in_tile < token_stride; ++token_in_tile) {
+                const int token = tile_token_start + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_scores[token_in_tile] = -FLT_MAX;
+                    tile_weights[token_in_tile] = 0.0f;
+                    continue;
+                }
+                const float score = tile_scores[token_in_tile] * sm_scale;
+                tile_scores[token_in_tile] = score;
+                tile_max = fmaxf(tile_max, score);
+            }
+
+            const float next_max = fmaxf(running_max, tile_max);
+            output_scale = expf(running_max - next_max);
+            running_sum *= output_scale;
+            for (int token_in_tile = 0; token_in_tile < token_stride; ++token_in_tile) {
+                const int token = tile_token_start + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_weights[token_in_tile] = 0.0f;
+                    continue;
+                }
+                const float weight = expf(tile_scores[token_in_tile] - next_max);
+                tile_weights[token_in_tile] = weight;
+                running_sum += weight;
+            }
+            running_max = next_max;
+        }
+        __syncthreads();
+
+        acc0 *= output_scale;
+        acc1 *= output_scale;
+
+        for (int col_tile = 0; col_tile < v_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                v_sign_mantissa,
+                v_compressed_full,
+                v_bitmap1,
+                v_bitmap2,
+                v_bitmap3,
+                v_tile_offsets_median,
+                v_tile_offsets_global,
+                v_max_high_freq_count,
+                v_max_full_count,
+                v_start_exp,
+                v_rows,
+                v_cols,
+                row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            if (dim0 < head_dim && (dim0 / kTileK) == col_tile) {
+                const int local_col0 = dim0 % kTileK;
+                for (int token_in_tile = 0; token_in_tile < token_stride; ++token_in_tile) {
+                    const int token = row_tile * token_stride + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    const int local_row = kv_head + token_in_tile * num_kv_heads;
+                    acc0 += tile_weights[token_in_tile] *
+                            __bfloat162float(smem_output[local_row][local_col0]);
+                }
+            }
+            if (dim1 < head_dim && (dim1 / kTileK) == col_tile) {
+                const int local_col1 = dim1 % kTileK;
+                for (int token_in_tile = 0; token_in_tile < token_stride; ++token_in_tile) {
+                    const int token = row_tile * token_stride + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    const int local_row = kv_head + token_in_tile * num_kv_heads;
+                    acc1 += tile_weights[token_in_tile] *
+                            __bfloat162float(smem_output[local_row][local_col1]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const float inv_sum = 1.0f / running_sum;
+    if (dim0 < head_dim) {
+        output[q_head * head_dim + dim0] = acc0 * inv_sum;
+    }
+    if (dim1 < head_dim) {
+        output[q_head * head_dim + dim1] = acc1 * inv_sum;
+    }
+}
+
+template <typename TilingConfig>
+__global__ void ZipservDecodeAttentionOnlineBatchedKernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_sign_mantissa,
+    const __nv_bfloat16* __restrict__ k_compressed_full,
+    const uint64_t* __restrict__ k_bitmap1,
+    const uint64_t* __restrict__ k_bitmap2,
+    const uint64_t* __restrict__ k_bitmap3,
+    const int* __restrict__ k_tile_offsets_median,
+    const int* __restrict__ k_tile_offsets_global,
+    int k_rows,
+    int k_cols,
+    int k_batch_stride_rows,
+    int k_head_stride_rows,
+    int k_max_high_freq_count,
+    int k_max_full_count,
+    uint8_t k_start_exp,
+    const uint8_t* __restrict__ v_sign_mantissa,
+    const __nv_bfloat16* __restrict__ v_compressed_full,
+    const uint64_t* __restrict__ v_bitmap1,
+    const uint64_t* __restrict__ v_bitmap2,
+    const uint64_t* __restrict__ v_bitmap3,
+    const int* __restrict__ v_tile_offsets_median,
+    const int* __restrict__ v_tile_offsets_global,
+    int v_rows,
+    int v_cols,
+    int v_batch_stride_rows,
+    int v_head_stride_rows,
+    int v_max_high_freq_count,
+    int v_max_full_count,
+    uint8_t v_start_exp,
+    int logical_kv_len,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float sm_scale,
+    float* __restrict__ output) {
+    const int q_head = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int kv_group_size = num_q_heads / num_kv_heads;
+    const int kv_head = q_head / kv_group_size;
+    const int token_group = threadIdx.x / 16;
+    const int lane_in_group = threadIdx.x % 16;
+    const int dim0 = threadIdx.x;
+    const int dim1 = threadIdx.x + kThreadsPerBlock;
+    const int batch_stride_tiles = k_batch_stride_rows / kTileM;
+    const int head_stride_tiles = k_head_stride_rows / kTileM;
+    const int v_batch_stride_tiles = v_batch_stride_rows / kTileM;
+    const int v_head_stride_tiles = v_head_stride_rows / kTileM;
+
+    extern __shared__ __align__(128) __nv_bfloat16 smem_buffer[];
+    auto* smem_output = reinterpret_cast<__nv_bfloat16(*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(smem_buffer);
+    const int bitmap_size = TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3;
+    uint64_t* smem_bitmap1 = reinterpret_cast<uint64_t*>(smem_output + 64);
+    uint64_t* smem_bitmap2 = smem_bitmap1 + bitmap_size;
+    uint64_t* smem_bitmap3 = smem_bitmap2 + bitmap_size;
+    uint8_t* smem_sign_mantissa = reinterpret_cast<uint8_t*>(smem_bitmap3 + bitmap_size);
+    const size_t shared_hf_count = static_cast<size_t>(
+        k_max_high_freq_count > v_max_high_freq_count ? k_max_high_freq_count : v_max_high_freq_count);
+    const size_t shared_full_count = static_cast<size_t>(
+        k_max_full_count > v_max_full_count ? k_max_full_count : v_max_full_count);
+    const size_t padding = (128 - (shared_hf_count % 128)) % 128;
+    __nv_bfloat16* smem_full_values =
+        reinterpret_cast<__nv_bfloat16*>(smem_sign_mantissa + shared_hf_count + padding);
+    float* smem_q_group = reinterpret_cast<float*>(smem_full_values + shared_full_count);
+
+    __shared__ float tile_scores[64];
+    __shared__ float tile_weights[64];
+    __shared__ float running_max;
+    __shared__ float running_sum;
+    __shared__ float output_scale;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (threadIdx.x == 0) {
+        running_max = -FLT_MAX;
+        running_sum = 0.0f;
+        output_scale = 0.0f;
+    }
+    for (int idx = threadIdx.x; idx < 64; idx += blockDim.x) {
+        tile_scores[idx] = 0.0f;
+        tile_weights[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    const int q_batch_stride = num_q_heads * head_dim;
+    const int output_batch_stride = num_q_heads * head_dim;
+    const int q_head_base = batch_idx * q_batch_stride + q_head * head_dim;
+    const int output_head_base = batch_idx * output_batch_stride + q_head * head_dim;
+    const int k_col_tiles = k_cols / kTileK;
+    const int v_col_tiles = v_cols / kTileK;
+    const int row_tiles = (logical_kv_len + kTileM - 1) / kTileM;
+    const int k_row_tile_base = batch_idx * batch_stride_tiles + kv_head * head_stride_tiles;
+    const int v_row_tile_base = batch_idx * v_batch_stride_tiles + kv_head * v_head_stride_tiles;
+
+    for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        for (int idx = threadIdx.x; idx < 64; idx += blockDim.x) {
+            tile_scores[idx] = 0.0f;
+            tile_weights[idx] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int col_tile = 0; col_tile < k_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                k_sign_mantissa,
+                k_compressed_full,
+                k_bitmap1,
+                k_bitmap2,
+                k_bitmap3,
+                k_tile_offsets_median,
+                k_tile_offsets_global,
+                k_max_high_freq_count,
+                k_max_full_count,
+                k_start_exp,
+                k_rows,
+                k_cols,
+                k_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            #pragma unroll
+            for (int token_chunk = 0; token_chunk < 64; token_chunk += 8) {
+                const int token_in_tile = token_chunk + token_group;
+                const int token = row_tile * kTileM + token_in_tile;
+                float partial = 0.0f;
+                if (token < logical_kv_len) {
+                    const int q_base = q_head_base + col_tile * kTileK;
+                    partial += __bfloat162float(q[q_base + lane_in_group]) *
+                               __bfloat162float(smem_output[token_in_tile][lane_in_group]);
+                    partial += __bfloat162float(q[q_base + lane_in_group + 16]) *
+                               __bfloat162float(smem_output[token_in_tile][lane_in_group + 16]);
+                    partial += __bfloat162float(q[q_base + lane_in_group + 32]) *
+                               __bfloat162float(smem_output[token_in_tile][lane_in_group + 32]);
+                    partial += __bfloat162float(q[q_base + lane_in_group + 48]) *
+                               __bfloat162float(smem_output[token_in_tile][lane_in_group + 48]);
+                }
+                for (int offset = 8; offset > 0; offset /= 2) {
+                    partial += __shfl_down_sync(0xFFFFFFFF, partial, offset, 16);
+                }
+                if (lane_in_group == 0 && token < logical_kv_len) {
+                    tile_scores[token_in_tile] += partial;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            const int tile_token_start = row_tile * kTileM;
+            float tile_max = -FLT_MAX;
+            for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                const int token = tile_token_start + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_scores[token_in_tile] = -FLT_MAX;
+                    tile_weights[token_in_tile] = 0.0f;
+                    continue;
+                }
+                const float score = tile_scores[token_in_tile] * sm_scale;
+                tile_scores[token_in_tile] = score;
+                tile_max = fmaxf(tile_max, score);
+            }
+
+            const float next_max = fmaxf(running_max, tile_max);
+            output_scale = expf(running_max - next_max);
+            running_sum *= output_scale;
+            for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                const int token = tile_token_start + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_weights[token_in_tile] = 0.0f;
+                    continue;
+                }
+                const float weight = expf(tile_scores[token_in_tile] - next_max);
+                tile_weights[token_in_tile] = weight;
+                running_sum += weight;
+            }
+            running_max = next_max;
+        }
+        __syncthreads();
+
+        acc0 *= output_scale;
+        acc1 *= output_scale;
+
+        for (int col_tile = 0; col_tile < v_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                v_sign_mantissa,
+                v_compressed_full,
+                v_bitmap1,
+                v_bitmap2,
+                v_bitmap3,
+                v_tile_offsets_median,
+                v_tile_offsets_global,
+                v_max_high_freq_count,
+                v_max_full_count,
+                v_start_exp,
+                v_rows,
+                v_cols,
+                v_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            if (dim0 < head_dim && (dim0 / kTileK) == col_tile) {
+                const int local_col0 = dim0 % kTileK;
+                #pragma unroll
+                for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                    const int token = row_tile * kTileM + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    acc0 += tile_weights[token_in_tile] *
+                            __bfloat162float(smem_output[token_in_tile][local_col0]);
+                }
+            }
+            if (dim1 < head_dim && (dim1 / kTileK) == col_tile) {
+                const int local_col1 = dim1 % kTileK;
+                #pragma unroll
+                for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                    const int token = row_tile * kTileM + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    acc1 += tile_weights[token_in_tile] *
+                            __bfloat162float(smem_output[token_in_tile][local_col1]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const float inv_sum = 1.0f / running_sum;
+    if (dim0 < head_dim) {
+        output[output_head_base + dim0] = acc0 * inv_sum;
+    }
+    if (dim1 < head_dim) {
+        output[output_head_base + dim1] = acc1 * inv_sum;
+    }
+}
+
+template <typename TilingConfig>
+__global__ void ZipservDecodeAttentionOnlineGroupedBatchedKernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_sign_mantissa,
+    const __nv_bfloat16* __restrict__ k_compressed_full,
+    const uint64_t* __restrict__ k_bitmap1,
+    const uint64_t* __restrict__ k_bitmap2,
+    const uint64_t* __restrict__ k_bitmap3,
+    const int* __restrict__ k_tile_offsets_median,
+    const int* __restrict__ k_tile_offsets_global,
+    int k_rows,
+    int k_cols,
+    int k_batch_stride_rows,
+    int k_head_stride_rows,
+    int k_max_high_freq_count,
+    int k_max_full_count,
+    uint8_t k_start_exp,
+    const uint8_t* __restrict__ v_sign_mantissa,
+    const __nv_bfloat16* __restrict__ v_compressed_full,
+    const uint64_t* __restrict__ v_bitmap1,
+    const uint64_t* __restrict__ v_bitmap2,
+    const uint64_t* __restrict__ v_bitmap3,
+    const int* __restrict__ v_tile_offsets_median,
+    const int* __restrict__ v_tile_offsets_global,
+    int v_rows,
+    int v_cols,
+    int v_batch_stride_rows,
+    int v_head_stride_rows,
+    int v_max_high_freq_count,
+    int v_max_full_count,
+    uint8_t v_start_exp,
+    int logical_kv_len,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float sm_scale,
+    float* __restrict__ output) {
+    constexpr int kQGroupSize = 8;
+    const int kv_head = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int token_group = threadIdx.x / 16;
+    const int lane_in_group = threadIdx.x % 16;
+    const int dim0 = threadIdx.x;
+    const int dim1 = threadIdx.x + kThreadsPerBlock;
+    const int batch_stride_tiles = k_batch_stride_rows / kTileM;
+    const int head_stride_tiles = k_head_stride_rows / kTileM;
+    const int v_batch_stride_tiles = v_batch_stride_rows / kTileM;
+    const int v_head_stride_tiles = v_head_stride_rows / kTileM;
+    const int q_head_group_base = kv_head * kQGroupSize;
+
+    extern __shared__ __align__(128) __nv_bfloat16 smem_buffer[];
+    auto* smem_output = reinterpret_cast<__nv_bfloat16(*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(smem_buffer);
+    const int bitmap_size = TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3;
+    uint64_t* smem_bitmap1 = reinterpret_cast<uint64_t*>(smem_output + 64);
+    uint64_t* smem_bitmap2 = smem_bitmap1 + bitmap_size;
+    uint64_t* smem_bitmap3 = smem_bitmap2 + bitmap_size;
+    uint8_t* smem_sign_mantissa = reinterpret_cast<uint8_t*>(smem_bitmap3 + bitmap_size);
+    const size_t shared_hf_count = static_cast<size_t>(
+        k_max_high_freq_count > v_max_high_freq_count ? k_max_high_freq_count : v_max_high_freq_count);
+    const size_t shared_full_count = static_cast<size_t>(
+        k_max_full_count > v_max_full_count ? k_max_full_count : v_max_full_count);
+    const size_t padding = (128 - (shared_hf_count % 128)) % 128;
+    __nv_bfloat16* smem_full_values =
+        reinterpret_cast<__nv_bfloat16*>(smem_sign_mantissa + shared_hf_count + padding);
+    float* smem_q_group = reinterpret_cast<float*>(smem_full_values + shared_full_count);
+
+    __shared__ float tile_scores[kQGroupSize][64];
+    __shared__ float tile_weights[kQGroupSize][64];
+    __shared__ float running_max[kQGroupSize];
+    __shared__ float running_sum[kQGroupSize];
+    __shared__ float output_scale[kQGroupSize];
+
+    float acc0[kQGroupSize];
+    float acc1[kQGroupSize];
+    #pragma unroll
+    for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+        acc0[qh_local] = 0.0f;
+        acc1[qh_local] = 0.0f;
+    }
+
+    if (threadIdx.x < kQGroupSize) {
+        running_max[threadIdx.x] = -FLT_MAX;
+        running_sum[threadIdx.x] = 0.0f;
+        output_scale[threadIdx.x] = 0.0f;
+    }
+    for (int idx = threadIdx.x; idx < kQGroupSize * 64; idx += blockDim.x) {
+        tile_scores[idx / 64][idx % 64] = 0.0f;
+        tile_weights[idx / 64][idx % 64] = 0.0f;
+    }
+    __syncthreads();
+
+    const int q_batch_stride = num_q_heads * head_dim;
+    const int output_batch_stride = num_q_heads * head_dim;
+    const int k_col_tiles = k_cols / kTileK;
+    const int v_col_tiles = v_cols / kTileK;
+    const int row_tiles = (logical_kv_len + kTileM - 1) / kTileM;
+    const int k_row_tile_base = batch_idx * batch_stride_tiles + kv_head * head_stride_tiles;
+    const int v_row_tile_base = batch_idx * v_batch_stride_tiles + kv_head * v_head_stride_tiles;
+    for (int idx = threadIdx.x; idx < kQGroupSize * head_dim; idx += blockDim.x) {
+        const int qh_local = idx / head_dim;
+        const int d = idx % head_dim;
+        const int q_head = q_head_group_base + qh_local;
+        smem_q_group[idx] = __bfloat162float(q[batch_idx * q_batch_stride + q_head * head_dim + d]);
+    }
+    __syncthreads();
+
+    for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        for (int idx = threadIdx.x; idx < kQGroupSize * 64; idx += blockDim.x) {
+            tile_scores[idx / 64][idx % 64] = 0.0f;
+            tile_weights[idx / 64][idx % 64] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int col_tile = 0; col_tile < k_col_tiles; ++col_tile) {
+            float qv0[kQGroupSize];
+            float qv1[kQGroupSize];
+            float qv2[kQGroupSize];
+            float qv3[kQGroupSize];
+            #pragma unroll
+            for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+                const int q_base = qh_local * head_dim + col_tile * kTileK;
+                qv0[qh_local] = smem_q_group[q_base + lane_in_group];
+                qv1[qh_local] = smem_q_group[q_base + lane_in_group + 16];
+                qv2[qh_local] = smem_q_group[q_base + lane_in_group + 32];
+                qv3[qh_local] = smem_q_group[q_base + lane_in_group + 48];
+            }
+
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                k_sign_mantissa,
+                k_compressed_full,
+                k_bitmap1,
+                k_bitmap2,
+                k_bitmap3,
+                k_tile_offsets_median,
+                k_tile_offsets_global,
+                k_max_high_freq_count,
+                k_max_full_count,
+                k_start_exp,
+                k_rows,
+                k_cols,
+                k_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            #pragma unroll
+            for (int token_chunk = 0; token_chunk < 64; token_chunk += 8) {
+                const int token_in_tile = token_chunk + token_group;
+                const int token = row_tile * kTileM + token_in_tile;
+                float k0 = 0.0f;
+                float k1 = 0.0f;
+                float k2 = 0.0f;
+                float k3 = 0.0f;
+                if (token < logical_kv_len) {
+                    k0 = __bfloat162float(smem_output[token_in_tile][lane_in_group]);
+                    k1 = __bfloat162float(smem_output[token_in_tile][lane_in_group + 16]);
+                    k2 = __bfloat162float(smem_output[token_in_tile][lane_in_group + 32]);
+                    k3 = __bfloat162float(smem_output[token_in_tile][lane_in_group + 48]);
+                }
+                #pragma unroll
+                for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+                    float partial = 0.0f;
+                    if (token < logical_kv_len) {
+                        partial = fmaf(qv0[qh_local], k0, partial);
+                        partial = fmaf(qv1[qh_local], k1, partial);
+                        partial = fmaf(qv2[qh_local], k2, partial);
+                        partial = fmaf(qv3[qh_local], k3, partial);
+                    }
+                    for (int offset = 8; offset > 0; offset /= 2) {
+                        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset, 16);
+                    }
+                    if (lane_in_group == 0 && token < logical_kv_len) {
+                        tile_scores[qh_local][token_in_tile] += partial;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x < kQGroupSize) {
+            const int qh_local = threadIdx.x;
+            const int tile_token_start = row_tile * kTileM;
+            float tile_max = -FLT_MAX;
+            for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                const int token = tile_token_start + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_scores[qh_local][token_in_tile] = -FLT_MAX;
+                    tile_weights[qh_local][token_in_tile] = 0.0f;
+                    continue;
+                }
+                const float score = tile_scores[qh_local][token_in_tile] * sm_scale;
+                tile_scores[qh_local][token_in_tile] = score;
+                tile_max = fmaxf(tile_max, score);
+            }
+
+            const float next_max = fmaxf(running_max[qh_local], tile_max);
+            output_scale[qh_local] = expf(running_max[qh_local] - next_max);
+            running_sum[qh_local] *= output_scale[qh_local];
+            for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                const int token = tile_token_start + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_weights[qh_local][token_in_tile] = 0.0f;
+                    continue;
+                }
+                const float weight = expf(tile_scores[qh_local][token_in_tile] - next_max);
+                tile_weights[qh_local][token_in_tile] = weight;
+                running_sum[qh_local] += weight;
+            }
+            running_max[qh_local] = next_max;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+            acc0[qh_local] *= output_scale[qh_local];
+            acc1[qh_local] *= output_scale[qh_local];
+        }
+
+        for (int col_tile = 0; col_tile < v_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                v_sign_mantissa,
+                v_compressed_full,
+                v_bitmap1,
+                v_bitmap2,
+                v_bitmap3,
+                v_tile_offsets_median,
+                v_tile_offsets_global,
+                v_max_high_freq_count,
+                v_max_full_count,
+                v_start_exp,
+                v_rows,
+                v_cols,
+                v_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            if (dim0 < head_dim && (dim0 / kTileK) == col_tile) {
+                const int local_col0 = dim0 % kTileK;
+                #pragma unroll
+                for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                    const int token = row_tile * kTileM + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    const float value = __bfloat162float(smem_output[token_in_tile][local_col0]);
+                    #pragma unroll
+                    for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+                        acc0[qh_local] = fmaf(tile_weights[qh_local][token_in_tile], value, acc0[qh_local]);
+                    }
+                }
+            }
+            if (dim1 < head_dim && (dim1 / kTileK) == col_tile) {
+                const int local_col1 = dim1 % kTileK;
+                #pragma unroll
+                for (int token_in_tile = 0; token_in_tile < 64; ++token_in_tile) {
+                    const int token = row_tile * kTileM + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    const float value = __bfloat162float(smem_output[token_in_tile][local_col1]);
+                    #pragma unroll
+                    for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+                        acc1[qh_local] = fmaf(tile_weights[qh_local][token_in_tile], value, acc1[qh_local]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int qh_local = 0; qh_local < kQGroupSize; ++qh_local) {
+        const float inv_sum = 1.0f / running_sum[qh_local];
+        const int q_head = q_head_group_base + qh_local;
+        const int output_head_base = batch_idx * output_batch_stride + q_head * head_dim;
+        if (dim0 < head_dim) {
+            output[output_head_base + dim0] = acc0[qh_local] * inv_sum;
+        }
+        if (dim1 < head_dim) {
+            output[output_head_base + dim1] = acc1[qh_local] * inv_sum;
+        }
+    }
+}
+
+template <typename TilingConfig>
+__global__ void ZipservDecodeAttentionOnlineGroupedQKernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_sign_mantissa,
+    const __nv_bfloat16* __restrict__ k_compressed_full,
+    const uint64_t* __restrict__ k_bitmap1,
+    const uint64_t* __restrict__ k_bitmap2,
+    const uint64_t* __restrict__ k_bitmap3,
+    const int* __restrict__ k_tile_offsets_median,
+    const int* __restrict__ k_tile_offsets_global,
+    int k_rows,
+    int k_cols,
+    int k_batch_stride_rows,
+    int k_head_stride_rows,
+    int k_max_high_freq_count,
+    int k_max_full_count,
+    uint8_t k_start_exp,
+    const uint8_t* __restrict__ v_sign_mantissa,
+    const __nv_bfloat16* __restrict__ v_compressed_full,
+    const uint64_t* __restrict__ v_bitmap1,
+    const uint64_t* __restrict__ v_bitmap2,
+    const uint64_t* __restrict__ v_bitmap3,
+    const int* __restrict__ v_tile_offsets_median,
+    const int* __restrict__ v_tile_offsets_global,
+    int v_rows,
+    int v_cols,
+    int v_batch_stride_rows,
+    int v_head_stride_rows,
+    int v_max_high_freq_count,
+    int v_max_full_count,
+    uint8_t v_start_exp,
+    int logical_kv_len,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float sm_scale,
+    float* __restrict__ output) {
+    constexpr int kGroupSize = 8;
+    constexpr int kTileTokens = 64;
+    const int kv_head = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int group_size = num_q_heads / num_kv_heads;
+    const int token_group = threadIdx.x / 16;
+    const int lane_in_group = threadIdx.x % 16;
+    const int dim = threadIdx.x;
+    if (dim >= head_dim) {
+        return;
+    }
+
+    extern __shared__ __align__(128) __nv_bfloat16 smem_buffer[];
+    auto* smem_output = reinterpret_cast<__nv_bfloat16(*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(smem_buffer);
+    const int bitmap_size = TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3;
+    uint64_t* smem_bitmap1 = reinterpret_cast<uint64_t*>(smem_output + 64);
+    uint64_t* smem_bitmap2 = smem_bitmap1 + bitmap_size;
+    uint64_t* smem_bitmap3 = smem_bitmap2 + bitmap_size;
+    uint8_t* smem_sign_mantissa = reinterpret_cast<uint8_t*>(smem_bitmap3 + bitmap_size);
+    const size_t shared_hf_count = static_cast<size_t>(
+        k_max_high_freq_count > v_max_high_freq_count ? k_max_high_freq_count : v_max_high_freq_count);
+    const size_t shared_full_count = static_cast<size_t>(
+        k_max_full_count > v_max_full_count ? k_max_full_count : v_max_full_count);
+    const size_t padding = (128 - (shared_hf_count % 128)) % 128;
+    __nv_bfloat16* smem_full_values =
+        reinterpret_cast<__nv_bfloat16*>(smem_sign_mantissa + shared_hf_count + padding);
+    uintptr_t smem_q_group_ptr = reinterpret_cast<uintptr_t>(smem_full_values + shared_full_count);
+    smem_q_group_ptr = (smem_q_group_ptr + alignof(float) - 1) & ~(static_cast<uintptr_t>(alignof(float)) - 1);
+    float* smem_q_group = reinterpret_cast<float*>(smem_q_group_ptr);
+    __shared__ float tile_scores[kGroupSize * kTileTokens];
+    __shared__ float tile_weights[kGroupSize * kTileTokens];
+    __shared__ float running_max[kGroupSize];
+    __shared__ float running_sum[kGroupSize];
+    __shared__ float output_scale[kGroupSize];
+
+    float acc[kGroupSize];
+    #pragma unroll
+    for (int q_local = 0; q_local < kGroupSize; ++q_local) {
+        acc[q_local] = 0.0f;
+    }
+
+    if (threadIdx.x < kGroupSize) {
+        running_max[threadIdx.x] = -FLT_MAX;
+        running_sum[threadIdx.x] = 0.0f;
+        output_scale[threadIdx.x] = 0.0f;
+    }
+    for (int idx = threadIdx.x; idx < kGroupSize * kTileTokens; idx += blockDim.x) {
+        tile_scores[idx] = 0.0f;
+        tile_weights[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    const int q_batch_stride = num_q_heads * head_dim;
+    const int output_batch_stride = num_q_heads * head_dim;
+    const int q_head_base = kv_head * group_size;
+    const int k_row_tile_base = batch_idx * (k_batch_stride_rows / kTileM) + kv_head * (k_head_stride_rows / kTileM);
+    const int v_row_tile_base = batch_idx * (v_batch_stride_rows / kTileM) + kv_head * (v_head_stride_rows / kTileM);
+    const int k_col_tiles = k_cols / kTileK;
+    const int v_col_tiles = v_cols / kTileK;
+    const int row_tiles = (logical_kv_len + kTileTokens - 1) / kTileTokens;
+
+    for (int idx = threadIdx.x; idx < group_size * head_dim; idx += blockDim.x) {
+        const int q_local = idx / head_dim;
+        const int d = idx % head_dim;
+        const int q_index =
+            batch_idx * q_batch_stride + (q_head_base + q_local) * head_dim + d;
+        smem_q_group[idx] = __bfloat162float(q[q_index]);
+    }
+    __syncthreads();
+
+    for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        for (int idx = threadIdx.x; idx < kGroupSize * kTileTokens; idx += blockDim.x) {
+            tile_scores[idx] = 0.0f;
+            tile_weights[idx] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int col_tile = 0; col_tile < k_col_tiles; ++col_tile) {
+            float qv0[kGroupSize];
+            float qv1[kGroupSize];
+            float qv2[kGroupSize];
+            float qv3[kGroupSize];
+            #pragma unroll
+            for (int q_local = 0; q_local < kGroupSize; ++q_local) {
+                const int q_offset = q_local * head_dim + col_tile * kTileK;
+                qv0[q_local] = smem_q_group[q_offset + lane_in_group];
+                qv1[q_local] = smem_q_group[q_offset + lane_in_group + 16];
+                qv2[q_local] = smem_q_group[q_offset + lane_in_group + 32];
+                qv3[q_local] = smem_q_group[q_offset + lane_in_group + 48];
+            }
+
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                k_sign_mantissa,
+                k_compressed_full,
+                k_bitmap1,
+                k_bitmap2,
+                k_bitmap3,
+                k_tile_offsets_median,
+                k_tile_offsets_global,
+                k_max_high_freq_count,
+                k_max_full_count,
+                k_start_exp,
+                k_rows,
+                k_cols,
+                k_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            #pragma unroll
+            for (int token_chunk = 0; token_chunk < kTileTokens; token_chunk += 8) {
+                const int token_in_tile = token_chunk + token_group;
+                const int token = row_tile * kTileTokens + token_in_tile;
+                float k0 = 0.0f;
+                float k1 = 0.0f;
+                float k2 = 0.0f;
+                float k3 = 0.0f;
+                if (token < logical_kv_len) {
+                    k0 = __bfloat162float(smem_output[token_in_tile][lane_in_group]);
+                    k1 = __bfloat162float(smem_output[token_in_tile][lane_in_group + 16]);
+                    k2 = __bfloat162float(smem_output[token_in_tile][lane_in_group + 32]);
+                    k3 = __bfloat162float(smem_output[token_in_tile][lane_in_group + 48]);
+                }
+                #pragma unroll
+                for (int q_local = 0; q_local < kGroupSize; ++q_local) {
+                    float partial = 0.0f;
+                    if (token < logical_kv_len) {
+                        partial = fmaf(qv0[q_local], k0, partial);
+                        partial = fmaf(qv1[q_local], k1, partial);
+                        partial = fmaf(qv2[q_local], k2, partial);
+                        partial = fmaf(qv3[q_local], k3, partial);
+                    }
+                    for (int offset = 8; offset > 0; offset /= 2) {
+                        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset, 16);
+                    }
+                    if (lane_in_group == 0 && token < logical_kv_len) {
+                        tile_scores[q_local * kTileTokens + token_in_tile] += partial;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        {
+            const int q_local = token_group;
+            const int softmax_lane = lane_in_group;
+            const int tile_token_start = row_tile * kTileTokens;
+            float tile_max = -FLT_MAX;
+            #pragma unroll
+            for (int token_in_tile = softmax_lane; token_in_tile < kTileTokens; token_in_tile += 16) {
+                const int token = tile_token_start + token_in_tile;
+                const int idx = q_local * kTileTokens + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_scores[idx] = -FLT_MAX;
+                    tile_weights[idx] = 0.0f;
+                    continue;
+                }
+                const float score = tile_scores[idx] * sm_scale;
+                tile_scores[idx] = score;
+                tile_max = fmaxf(tile_max, score);
+            }
+            for (int offset = 8; offset > 0; offset /= 2) {
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, offset, 16));
+            }
+
+            const float prev_max = running_max[q_local];
+            const float prev_sum = running_sum[q_local];
+            float next_max = tile_max;
+            if (softmax_lane == 0) {
+                next_max = fmaxf(prev_max, tile_max);
+                const float scale = expf(prev_max - next_max);
+                output_scale[q_local] = scale;
+                running_sum[q_local] = prev_sum * scale;
+            }
+            next_max = __shfl_sync(0xFFFFFFFF, next_max, 0, 16);
+
+            float partial_sum = 0.0f;
+            #pragma unroll
+            for (int token_in_tile = softmax_lane; token_in_tile < kTileTokens; token_in_tile += 16) {
+                const int token = tile_token_start + token_in_tile;
+                const int idx = q_local * kTileTokens + token_in_tile;
+                if (token >= logical_kv_len) {
+                    tile_weights[idx] = 0.0f;
+                    continue;
+                }
+                const float weight = expf(tile_scores[idx] - next_max);
+                tile_weights[idx] = weight;
+                partial_sum += weight;
+            }
+            for (int offset = 8; offset > 0; offset /= 2) {
+                partial_sum += __shfl_down_sync(0xFFFFFFFF, partial_sum, offset, 16);
+            }
+            if (softmax_lane == 0) {
+                running_sum[q_local] += partial_sum;
+                running_max[q_local] = next_max;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int q_local = 0; q_local < kGroupSize; ++q_local) {
+            acc[q_local] *= output_scale[q_local];
+        }
+
+        for (int col_tile = 0; col_tile < v_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                v_sign_mantissa,
+                v_compressed_full,
+                v_bitmap1,
+                v_bitmap2,
+                v_bitmap3,
+                v_tile_offsets_median,
+                v_tile_offsets_global,
+                v_max_high_freq_count,
+                v_max_full_count,
+                v_start_exp,
+                v_rows,
+                v_cols,
+                v_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            if ((dim / kTileK) == col_tile) {
+                const int local_col = dim % kTileK;
+                #pragma unroll
+                for (int token_in_tile = 0; token_in_tile < kTileTokens; ++token_in_tile) {
+                    const int token = row_tile * kTileTokens + token_in_tile;
+                    if (token >= logical_kv_len) break;
+                    const float value = __bfloat162float(smem_output[token_in_tile][local_col]);
+                    #pragma unroll
+                    for (int q_local = 0; q_local < kGroupSize; ++q_local) {
+                        acc[q_local] = fmaf(tile_weights[q_local * kTileTokens + token_in_tile], value, acc[q_local]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int q_local = 0; q_local < kGroupSize; ++q_local) {
+        const int out_base = batch_idx * output_batch_stride + (q_head_base + q_local) * head_dim;
+        output[out_base + dim] = acc[q_local] / running_sum[q_local];
+    }
+}
+
+template <typename TilingConfig>
+__global__ void ZipservDecodeAttentionOnlineGroupedPairKernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_sign_mantissa,
+    const __nv_bfloat16* __restrict__ k_compressed_full,
+    const uint64_t* __restrict__ k_bitmap1,
+    const uint64_t* __restrict__ k_bitmap2,
+    const uint64_t* __restrict__ k_bitmap3,
+    const int* __restrict__ k_tile_offsets_median,
+    const int* __restrict__ k_tile_offsets_global,
+    int k_rows,
+    int k_cols,
+    int k_batch_stride_rows,
+    int k_head_stride_rows,
+    int k_max_high_freq_count,
+    int k_max_full_count,
+    uint8_t k_start_exp,
+    const uint8_t* __restrict__ v_sign_mantissa,
+    const __nv_bfloat16* __restrict__ v_compressed_full,
+    const uint64_t* __restrict__ v_bitmap1,
+    const uint64_t* __restrict__ v_bitmap2,
+    const uint64_t* __restrict__ v_bitmap3,
+    const int* __restrict__ v_tile_offsets_median,
+    const int* __restrict__ v_tile_offsets_global,
+    int v_rows,
+    int v_cols,
+    int v_batch_stride_rows,
+    int v_head_stride_rows,
+    int v_max_high_freq_count,
+    int v_max_full_count,
+    uint8_t v_start_exp,
+    int logical_kv_len,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float sm_scale,
+    float* __restrict__ output) {
+    const int kv_head = blockIdx.x;
+    const int q_head_group = blockIdx.y * kGroupedQHeadsPerCta;
+    const int batch_idx = blockIdx.z;
+    const int kv_group_size = num_q_heads / num_kv_heads;
+    const int q_head_base = kv_head * kv_group_size + q_head_group;
+    const int remaining_q_heads = kv_group_size - q_head_group;
+    const int active_q_heads =
+        remaining_q_heads <= 0 ? 0 : (remaining_q_heads < kGroupedQHeadsPerCta ? remaining_q_heads : kGroupedQHeadsPerCta);
+    const int tid = threadIdx.x;
+    const int q_head_slot = tid / kThreadsPerGroupedQHead;
+    const int local_tid = tid % kThreadsPerGroupedQHead;
+    const int token_group = local_tid / 16;
+    const int lane_in_group = local_tid % 16;
+    const bool q_head_active = q_head_slot < active_q_heads;
+    const int q_head = q_head_base + q_head_slot;
+
+    extern __shared__ __align__(128) __nv_bfloat16 smem_buffer[];
+    auto* smem_output = reinterpret_cast<__nv_bfloat16(*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(smem_buffer);
+    const int bitmap_size = TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3;
+    uint64_t* smem_bitmap1 = reinterpret_cast<uint64_t*>(smem_output + kTileM);
+    uint64_t* smem_bitmap2 = smem_bitmap1 + bitmap_size;
+    uint64_t* smem_bitmap3 = smem_bitmap2 + bitmap_size;
+    uint8_t* smem_sign_mantissa = reinterpret_cast<uint8_t*>(smem_bitmap3 + bitmap_size);
+    const size_t shared_hf_count = static_cast<size_t>(
+        k_max_high_freq_count > v_max_high_freq_count ? k_max_high_freq_count : v_max_high_freq_count);
+    const size_t padding = (128 - (shared_hf_count % 128)) % 128;
+    __nv_bfloat16* smem_full_values =
+        reinterpret_cast<__nv_bfloat16*>(smem_sign_mantissa + shared_hf_count + padding);
+
+    __shared__ float tile_scores[kGroupedQHeadsPerCta][kTileM];
+    __shared__ float tile_weights[kGroupedQHeadsPerCta][kTileM];
+    __shared__ float running_max[kGroupedQHeadsPerCta];
+    __shared__ float running_sum[kGroupedQHeadsPerCta];
+    __shared__ float output_scale[kGroupedQHeadsPerCta];
+    __shared__ float inv_running_sum[kGroupedQHeadsPerCta];
+    __shared__ float softmax_warp_reduce[kGroupedQHeadsPerCta][2];
+
+    if (tid < kGroupedQHeadsPerCta) {
+        running_max[tid] = -INFINITY;
+        running_sum[tid] = 0.0f;
+        output_scale[tid] = 0.0f;
+        inv_running_sum[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    float acc[kMaxOutputAccumsPerThread] = {0.0f};
+    const int q_batch_stride = num_q_heads * head_dim;
+    const int output_batch_stride = num_q_heads * head_dim;
+    const int q_head_base_offset = batch_idx * q_batch_stride;
+    const int output_batch_base = batch_idx * output_batch_stride;
+    const int k_col_tiles = k_cols / kTileK;
+    const int v_col_tiles = v_cols / kTileK;
+    const int row_tiles = (logical_kv_len + kTileM - 1) / kTileM;
+    const int batch_stride_tiles = k_batch_stride_rows / kTileM;
+    const int head_stride_tiles = k_head_stride_rows / kTileM;
+    const int v_batch_stride_tiles = v_batch_stride_rows / kTileM;
+    const int v_head_stride_tiles = v_head_stride_rows / kTileM;
+    const int k_row_tile_base = batch_idx * batch_stride_tiles + kv_head * head_stride_tiles;
+    const int v_row_tile_base = batch_idx * v_batch_stride_tiles + kv_head * v_head_stride_tiles;
+    const __nv_bfloat16* q_ptr = q_head_active ? q + q_head_base_offset + q_head * head_dim : nullptr;
+
+    for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        if (tid < active_q_heads * kTileM) {
+            const int init_head = tid / kTileM;
+            const int init_token = tid % kTileM;
+            tile_scores[init_head][init_token] = 0.0f;
+            tile_weights[init_head][init_token] = 0.0f;
+        }
+        __syncthreads();
+
+        const int row_token_base = row_tile * kTileM;
+
+        for (int col_tile = 0; col_tile < k_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                k_sign_mantissa,
+                k_compressed_full,
+                k_bitmap1,
+                k_bitmap2,
+                k_bitmap3,
+                k_tile_offsets_median,
+                k_tile_offsets_global,
+                k_max_high_freq_count,
+                k_max_full_count,
+                k_start_exp,
+                k_rows,
+                k_cols,
+                k_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            if (q_head_active) {
+                const int q_base = col_tile * kTileK + lane_in_group;
+                const float q0 = __bfloat162float(q_ptr[q_base + 0]);
+                const float q1 = __bfloat162float(q_ptr[q_base + 16]);
+                const float q2 = __bfloat162float(q_ptr[q_base + 32]);
+                const float q3 = __bfloat162float(q_ptr[q_base + 48]);
+                #pragma unroll
+                for (int token_block = 0; token_block < (kTileM / kTokenGroupsPerGroupedQHead); ++token_block) {
+                    const int token_in_tile = token_block * kTokenGroupsPerGroupedQHead + token_group;
+                    const int token = row_token_base + token_in_tile;
+                    float dot = 0.0f;
+                    if (token < logical_kv_len) {
+                        dot = fmaf(q0, __bfloat162float(smem_output[token_in_tile][lane_in_group + 0]), dot);
+                        dot = fmaf(q1, __bfloat162float(smem_output[token_in_tile][lane_in_group + 16]), dot);
+                        dot = fmaf(q2, __bfloat162float(smem_output[token_in_tile][lane_in_group + 32]), dot);
+                        dot = fmaf(q3, __bfloat162float(smem_output[token_in_tile][lane_in_group + 48]), dot);
+                    }
+                    for (int offset = 8; offset > 0; offset >>= 1) {
+                        dot += __shfl_down_sync(0xFFFFFFFFu, dot, offset, 16);
+                    }
+                    if (lane_in_group == 0 && token < logical_kv_len) {
+                        tile_scores[q_head_slot][token_in_tile] += dot;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (q_head_active) {
+            const int token_in_tile = local_tid;
+            const int token = row_token_base + token_in_tile;
+            const int warp_id = local_tid >> 5;
+            const int lane = local_tid & 31;
+
+            float score = -INFINITY;
+            if (token < logical_kv_len) {
+                score = tile_scores[q_head_slot][token_in_tile] * sm_scale;
+            }
+            tile_scores[q_head_slot][token_in_tile] = score;
+
+            float warp_max = score;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                warp_max = fmaxf(warp_max, __shfl_down_sync(0xFFFFFFFFu, warp_max, offset));
+            }
+            if (lane == 0) {
+                softmax_warp_reduce[q_head_slot][warp_id] = warp_max;
+            }
+        }
+        __syncthreads();
+
+        if (local_tid == 0 && q_head_active) {
+            const float tile_max = fmaxf(softmax_warp_reduce[q_head_slot][0], softmax_warp_reduce[q_head_slot][1]);
+            const float next_max =
+                running_sum[q_head_slot] > 0.0f ? fmaxf(running_max[q_head_slot], tile_max) : tile_max;
+            const float scale_prev =
+                running_sum[q_head_slot] > 0.0f ? __expf(running_max[q_head_slot] - next_max) : 0.0f;
+            output_scale[q_head_slot] = scale_prev;
+            running_max[q_head_slot] = next_max;
+            running_sum[q_head_slot] *= scale_prev;
+        }
+        __syncthreads();
+
+        if (q_head_active) {
+            const int token_in_tile = local_tid;
+            const int token = row_token_base + token_in_tile;
+            const int warp_id = local_tid >> 5;
+            const int lane = local_tid & 31;
+
+            float weight = 0.0f;
+            if (token < logical_kv_len) {
+                weight = __expf(tile_scores[q_head_slot][token_in_tile] - running_max[q_head_slot]);
+            }
+            tile_weights[q_head_slot][token_in_tile] = weight;
+
+            float warp_sum = weight;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                warp_sum += __shfl_down_sync(0xFFFFFFFFu, warp_sum, offset);
+            }
+            if (lane == 0) {
+                softmax_warp_reduce[q_head_slot][warp_id] = warp_sum;
+            }
+        }
+        __syncthreads();
+
+        if (local_tid == 0 && q_head_active) {
+            running_sum[q_head_slot] += softmax_warp_reduce[q_head_slot][0] + softmax_warp_reduce[q_head_slot][1];
+        }
+        __syncthreads();
+
+        if (q_head_active) {
+            #pragma unroll
+            for (int acc_idx = 0; acc_idx < kMaxOutputAccumsPerThread; ++acc_idx) {
+                acc[acc_idx] *= output_scale[q_head_slot];
+            }
+        }
+
+        for (int col_tile = 0; col_tile < v_col_tiles; ++col_tile) {
+            LoadZipservGlobalTileToShared<TilingConfig>(
+                v_sign_mantissa,
+                v_compressed_full,
+                v_bitmap1,
+                v_bitmap2,
+                v_bitmap3,
+                v_tile_offsets_median,
+                v_tile_offsets_global,
+                v_max_high_freq_count,
+                v_max_full_count,
+                v_start_exp,
+                v_rows,
+                v_cols,
+                v_row_tile_base + row_tile,
+                col_tile,
+                smem_output,
+                smem_bitmap1,
+                smem_bitmap2,
+                smem_bitmap3,
+                smem_sign_mantissa,
+                smem_full_values);
+
+            if (q_head_active) {
+                const int col_start = col_tile * kTileK;
+                #pragma unroll
+                for (int acc_idx = 0; acc_idx < kMaxOutputAccumsPerThread; ++acc_idx) {
+                    const int dim = local_tid + acc_idx * kThreadsPerGroupedQHead;
+                    if (dim >= col_start && dim < col_start + kTileK && dim < head_dim) {
+                        const int local_col = dim - col_start;
+                        #pragma unroll
+                        for (int token_in_tile = 0; token_in_tile < kTileM; ++token_in_tile) {
+                            const int token = row_token_base + token_in_tile;
+                            if (token >= logical_kv_len) {
+                                break;
+                            }
+                            acc[acc_idx] = fmaf(
+                                tile_weights[q_head_slot][token_in_tile],
+                                __bfloat162float(smem_output[token_in_tile][local_col]),
+                                acc[acc_idx]);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (local_tid == 0 && q_head_active) {
+        inv_running_sum[q_head_slot] = 1.0f / running_sum[q_head_slot];
+    }
+    __syncthreads();
+
+    if (q_head_active) {
+        const int output_head_base = output_batch_base + q_head * head_dim;
+        #pragma unroll
+        for (int acc_idx = 0; acc_idx < kMaxOutputAccumsPerThread; ++acc_idx) {
+            const int dim = local_tid + acc_idx * kThreadsPerGroupedQHead;
+            if (dim < head_dim) {
+                output[output_head_base + dim] = acc[acc_idx] * inv_running_sum[q_head_slot];
+            }
+        }
+    }
+}
+
 __global__ void RowSoftmaxKernel(
     const float* __restrict__ scores,
     float* __restrict__ probs,
@@ -769,6 +2116,211 @@ torch::Tensor zipserv_decode_attention_cuda(
         static_cast<int>(num_kv_heads),
         static_cast<int>(head_dim),
         output.data_ptr<float>());
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+torch::Tensor zipserv_decode_attention_online_cuda(
+    torch::Tensor q,
+    torch::Tensor k_sign_mantissa,
+    torch::Tensor k_compressed_full,
+    torch::Tensor k_bitmap1,
+    torch::Tensor k_bitmap2,
+    torch::Tensor k_bitmap3,
+    torch::Tensor k_tile_offsets_median,
+    torch::Tensor k_tile_offsets_global,
+    int64_t k_rows,
+    int64_t k_cols,
+    int64_t k_batch_stride_rows,
+    int64_t k_head_stride_rows,
+    int64_t k_max_high_freq_count,
+    int64_t k_max_full_count,
+    int64_t k_start_exp,
+    torch::Tensor v_sign_mantissa,
+    torch::Tensor v_compressed_full,
+    torch::Tensor v_bitmap1,
+    torch::Tensor v_bitmap2,
+    torch::Tensor v_bitmap3,
+    torch::Tensor v_tile_offsets_median,
+    torch::Tensor v_tile_offsets_global,
+    int64_t v_rows,
+    int64_t v_cols,
+    int64_t v_batch_stride_rows,
+    int64_t v_head_stride_rows,
+    int64_t v_max_high_freq_count,
+    int64_t v_max_full_count,
+    int64_t v_start_exp,
+    int64_t logical_kv_len,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    double sm_scale) {
+    TORCH_CHECK(k_rows == v_rows, "K/V rows must match");
+    TORCH_CHECK(k_cols == v_cols, "K/V cols must match");
+    TORCH_CHECK(k_cols == head_dim, "compressed K cols must match head_dim");
+    TORCH_CHECK(v_cols == head_dim, "compressed V cols must match head_dim");
+    TORCH_CHECK(k_rows % kTileM == 0, "compressed K rows must be padded to a multiple of 64");
+    TORCH_CHECK(k_cols % kTileK == 0, "compressed K cols must be padded to a multiple of 64");
+    TORCH_CHECK(v_rows % kTileM == 0, "compressed V rows must be padded to a multiple of 64");
+    TORCH_CHECK(v_cols % kTileK == 0, "compressed V cols must be padded to a multiple of 64");
+    TORCH_CHECK(num_q_heads > 0, "num_q_heads must be > 0");
+    TORCH_CHECK(num_kv_heads > 0, "num_kv_heads must be > 0");
+    TORCH_CHECK(head_dim > 0, "head_dim must be > 0");
+    TORCH_CHECK(head_dim <= 256, "zipserv fused native decode attention currently requires head_dim <= 256");
+    TORCH_CHECK(logical_kv_len > 0, "logical_kv_len must be > 0");
+    TORCH_CHECK(num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(num_kv_heads == 8, "zipserv fused native decode attention currently requires num_kv_heads == 8");
+    TORCH_CHECK(k_batch_stride_rows > 0 && v_batch_stride_rows > 0, "batch strides must be > 0");
+    TORCH_CHECK(k_head_stride_rows > 0 && v_head_stride_rows > 0, "head strides must be > 0");
+    TORCH_CHECK(k_rows % k_batch_stride_rows == 0, "K rows must be divisible by k_batch_stride_rows");
+    TORCH_CHECK(v_rows % v_batch_stride_rows == 0, "V rows must be divisible by v_batch_stride_rows");
+    TORCH_CHECK(k_head_stride_rows * num_kv_heads >= logical_kv_len * num_kv_heads,
+                "logical_kv_len exceeds K row capacity for the provided stride metadata");
+    TORCH_CHECK(v_head_stride_rows * num_kv_heads >= logical_kv_len * num_kv_heads,
+                "logical_kv_len exceeds V row capacity for the provided stride metadata");
+    TORCH_CHECK(logical_kv_len <= (k_rows / num_kv_heads), "logical_kv_len exceeds compressed row capacity");
+    TORCH_CHECK(k_batch_stride_rows % kTileM == 0, "K batch stride rows must be a multiple of 64");
+    TORCH_CHECK(v_batch_stride_rows % kTileM == 0, "V batch stride rows must be a multiple of 64");
+    TORCH_CHECK(k_head_stride_rows % kTileM == 0, "K head stride rows must be a multiple of 64");
+    TORCH_CHECK(v_head_stride_rows % kTileM == 0, "V head stride rows must be a multiple of 64");
+    using Config = TilingConfigBF16TripleBitmap<4, 1, 4>;
+    auto stream = at::cuda::getDefaultCUDAStream(q.device().index()).stream();
+    const int shared_hf = std::max(static_cast<int>(k_max_high_freq_count), static_cast<int>(v_max_high_freq_count));
+    const int shared_full = std::max(static_cast<int>(k_max_full_count), static_cast<int>(v_max_full_count));
+    const size_t shared_bytes = ComputeSharedBytes(shared_hf, shared_full);
+    if (q.dim() == 2) {
+        auto output = torch::empty(
+            {num_q_heads, head_dim},
+            q.options().dtype(torch::kFloat32));
+        ZipservDecodeAttentionOnlineKernel<Config>
+            <<<static_cast<unsigned int>(num_q_heads), kThreadsPerBlock, shared_bytes, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+                k_sign_mantissa.data_ptr<uint8_t>(),
+                reinterpret_cast<const __nv_bfloat16*>(k_compressed_full.data_ptr<at::BFloat16>()),
+                k_bitmap1.data_ptr<uint64_t>(),
+                k_bitmap2.data_ptr<uint64_t>(),
+                k_bitmap3.data_ptr<uint64_t>(),
+                k_tile_offsets_median.data_ptr<int>(),
+                k_tile_offsets_global.data_ptr<int>(),
+                static_cast<int>(k_rows),
+                static_cast<int>(k_cols),
+                static_cast<int>(k_max_high_freq_count),
+                static_cast<int>(k_max_full_count),
+                static_cast<uint8_t>(k_start_exp),
+                v_sign_mantissa.data_ptr<uint8_t>(),
+                reinterpret_cast<const __nv_bfloat16*>(v_compressed_full.data_ptr<at::BFloat16>()),
+                v_bitmap1.data_ptr<uint64_t>(),
+                v_bitmap2.data_ptr<uint64_t>(),
+                v_bitmap3.data_ptr<uint64_t>(),
+                v_tile_offsets_median.data_ptr<int>(),
+                v_tile_offsets_global.data_ptr<int>(),
+                static_cast<int>(v_rows),
+                static_cast<int>(v_cols),
+                static_cast<int>(v_max_high_freq_count),
+                static_cast<int>(v_max_full_count),
+                static_cast<uint8_t>(v_start_exp),
+                static_cast<int>(logical_kv_len),
+                static_cast<int>(num_q_heads),
+                static_cast<int>(num_kv_heads),
+                static_cast<int>(head_dim),
+                static_cast<float>(sm_scale),
+                output.data_ptr<float>());
+        CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
+
+    const int batch_size = static_cast<int>(q.size(0));
+    TORCH_CHECK(k_rows == batch_size * k_batch_stride_rows, "K rows must match batch_size * k_batch_stride_rows");
+    TORCH_CHECK(v_rows == batch_size * v_batch_stride_rows, "V rows must match batch_size * v_batch_stride_rows");
+    auto output = torch::empty(
+        {batch_size, num_q_heads, head_dim},
+        q.options().dtype(torch::kFloat32));
+    if (batch_size == 1) {
+        const dim3 grid(static_cast<unsigned int>(num_q_heads), static_cast<unsigned int>(batch_size));
+        ZipservDecodeAttentionOnlineBatchedKernel<Config>
+            <<<grid, kThreadsPerBlock, shared_bytes, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+                k_sign_mantissa.data_ptr<uint8_t>(),
+                reinterpret_cast<const __nv_bfloat16*>(k_compressed_full.data_ptr<at::BFloat16>()),
+                k_bitmap1.data_ptr<uint64_t>(),
+                k_bitmap2.data_ptr<uint64_t>(),
+                k_bitmap3.data_ptr<uint64_t>(),
+                k_tile_offsets_median.data_ptr<int>(),
+                k_tile_offsets_global.data_ptr<int>(),
+                static_cast<int>(k_rows),
+                static_cast<int>(k_cols),
+                static_cast<int>(k_batch_stride_rows),
+                static_cast<int>(k_head_stride_rows),
+                static_cast<int>(k_max_high_freq_count),
+                static_cast<int>(k_max_full_count),
+                static_cast<uint8_t>(k_start_exp),
+                v_sign_mantissa.data_ptr<uint8_t>(),
+                reinterpret_cast<const __nv_bfloat16*>(v_compressed_full.data_ptr<at::BFloat16>()),
+                v_bitmap1.data_ptr<uint64_t>(),
+                v_bitmap2.data_ptr<uint64_t>(),
+                v_bitmap3.data_ptr<uint64_t>(),
+                v_tile_offsets_median.data_ptr<int>(),
+                v_tile_offsets_global.data_ptr<int>(),
+                static_cast<int>(v_rows),
+                static_cast<int>(v_cols),
+                static_cast<int>(v_batch_stride_rows),
+                static_cast<int>(v_head_stride_rows),
+                static_cast<int>(v_max_high_freq_count),
+                static_cast<int>(v_max_full_count),
+                static_cast<uint8_t>(v_start_exp),
+                static_cast<int>(logical_kv_len),
+                static_cast<int>(num_q_heads),
+                static_cast<int>(num_kv_heads),
+                static_cast<int>(head_dim),
+                static_cast<float>(sm_scale),
+                output.data_ptr<float>());
+        CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
+
+    TORCH_CHECK(num_q_heads / num_kv_heads == 8,
+                "Grouped batched online decode currently requires q_group_size == 8");
+    const size_t grouped_shared_bytes =
+        shared_bytes + (alignof(float) - 1) +
+        static_cast<size_t>(num_q_heads / num_kv_heads) * static_cast<size_t>(head_dim) * sizeof(float);
+    const dim3 grid(static_cast<unsigned int>(num_kv_heads), static_cast<unsigned int>(batch_size));
+    ZipservDecodeAttentionOnlineGroupedQKernel<Config>
+        <<<grid, kThreadsPerBlock, grouped_shared_bytes, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+            k_sign_mantissa.data_ptr<uint8_t>(),
+            reinterpret_cast<const __nv_bfloat16*>(k_compressed_full.data_ptr<at::BFloat16>()),
+            k_bitmap1.data_ptr<uint64_t>(),
+            k_bitmap2.data_ptr<uint64_t>(),
+            k_bitmap3.data_ptr<uint64_t>(),
+            k_tile_offsets_median.data_ptr<int>(),
+            k_tile_offsets_global.data_ptr<int>(),
+            static_cast<int>(k_rows),
+            static_cast<int>(k_cols),
+            static_cast<int>(k_batch_stride_rows),
+            static_cast<int>(k_head_stride_rows),
+            static_cast<int>(k_max_high_freq_count),
+            static_cast<int>(k_max_full_count),
+            static_cast<uint8_t>(k_start_exp),
+            v_sign_mantissa.data_ptr<uint8_t>(),
+            reinterpret_cast<const __nv_bfloat16*>(v_compressed_full.data_ptr<at::BFloat16>()),
+            v_bitmap1.data_ptr<uint64_t>(),
+            v_bitmap2.data_ptr<uint64_t>(),
+            v_bitmap3.data_ptr<uint64_t>(),
+            v_tile_offsets_median.data_ptr<int>(),
+            v_tile_offsets_global.data_ptr<int>(),
+            static_cast<int>(v_rows),
+            static_cast<int>(v_cols),
+            static_cast<int>(v_batch_stride_rows),
+            static_cast<int>(v_head_stride_rows),
+            static_cast<int>(v_max_high_freq_count),
+            static_cast<int>(v_max_full_count),
+            static_cast<uint8_t>(v_start_exp),
+            static_cast<int>(logical_kv_len),
+            static_cast<int>(num_q_heads),
+            static_cast<int>(num_kv_heads),
+            static_cast<int>(head_dim),
+            static_cast<float>(sm_scale),
+            output.data_ptr<float>());
     CUDA_CHECK(cudaGetLastError());
     return output;
 }

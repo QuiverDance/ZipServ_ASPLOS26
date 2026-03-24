@@ -7,6 +7,7 @@
 #include "namespace_config.h"
 
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <vector>
 
 #include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
@@ -41,6 +42,26 @@ struct Qkv_params {
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct ZipservCompressedKVParams {
+    const uint8_t *sign_mantissa;
+    const __nv_bfloat16 *compressed_full;
+    const uint64_t *bitmap1;
+    const uint64_t *bitmap2;
+    const uint64_t *bitmap3;
+    const int *tile_offsets_median;
+    const int *tile_offsets_global;
+
+    int rows;
+    int cols;
+    int batch_stride_rows;
+    int head_stride_rows;
+    int max_high_freq_count;
+    int max_full_count;
+    int start_exp;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -140,6 +161,11 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    bool has_zipserv_kv;
+    int zipserv_smem_bytes;
+    ZipservCompressedKVParams zipserv_k;
+    ZipservCompressedKVParams zipserv_v;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

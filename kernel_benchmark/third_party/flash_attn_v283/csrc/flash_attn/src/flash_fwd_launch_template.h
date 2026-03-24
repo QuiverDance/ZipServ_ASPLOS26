@@ -53,8 +53,28 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
-    // printf("smem_size = %d\n", smem_size);
+    const size_t smem_size = Kernel_traits::kSmemSize + (params.has_zipserv_kv ? params.zipserv_smem_bytes : 0);
+    int device;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    int max_smem_per_block = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &max_smem_per_block,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device));
+    TORCH_CHECK(
+        static_cast<int>(smem_size) <= max_smem_per_block,
+        "FlashAttention forward launch requires dynamic shared memory ",
+        smem_size,
+        " bytes, but device limit is ",
+        max_smem_per_block,
+        " bytes. head_dim=",
+        params.d,
+        ", seqlen_k=",
+        params.seqlen_k,
+        ", zipserv_smem_bytes=",
+        params.zipserv_smem_bytes,
+        ", base_kernel_smem=",
+        Kernel_traits::kSmemSize);
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     // https://github.com/kokkos/kokkos-kernels/issues/349
@@ -102,7 +122,28 @@ template<typename Kernel_traits, bool Is_causal>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    const size_t smem_size = Kernel_traits::kSmemSize + (params.has_zipserv_kv ? params.zipserv_smem_bytes : 0);
+    int device;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    int max_smem_per_block = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &max_smem_per_block,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device));
+    TORCH_CHECK(
+        static_cast<int>(smem_size) <= max_smem_per_block,
+        "FlashAttention split-kv launch requires dynamic shared memory ",
+        smem_size,
+        " bytes, but device limit is ",
+        max_smem_per_block,
+        " bytes. head_dim=",
+        params.d,
+        ", seqlen_k=",
+        params.seqlen_k,
+        ", zipserv_smem_bytes=",
+        params.zipserv_smem_bytes,
+        ", base_kernel_smem=",
+        Kernel_traits::kSmemSize);
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
@@ -163,6 +204,44 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
+    int device;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    int max_smem_per_block = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &max_smem_per_block,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device));
+    if (params.has_zipserv_kv) {
+        if constexpr (Headdim == 128) {
+            using Kernel64 = Flash_fwd_kernel_traits<Headdim, kBlockM, 64, 4, false, false, T>;
+            if (static_cast<int>(Kernel64::kSmemSize + params.zipserv_smem_bytes) <= max_smem_per_block) {
+                run_flash_splitkv_fwd<Kernel64, Is_causal>(params, stream);
+                return;
+            }
+            TORCH_CHECK(
+                false,
+                "No ZipServ split-kv kernel configuration fits the device shared-memory limit. head_dim=",
+                Headdim,
+                ", zipserv_smem_bytes=",
+                params.zipserv_smem_bytes,
+                ", device_limit=",
+                max_smem_per_block);
+        }
+        constexpr static int kDefaultBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
+        using DefaultKernel = Flash_fwd_kernel_traits<Headdim, kBlockM, kDefaultBlockN, 4, false, false, T>;
+        if (static_cast<int>(DefaultKernel::kSmemSize + params.zipserv_smem_bytes) <= max_smem_per_block) {
+            run_flash_splitkv_fwd<DefaultKernel, Is_causal>(params, stream);
+            return;
+        }
+        TORCH_CHECK(
+            false,
+            "No ZipServ split-kv kernel configuration fits the device shared-memory limit. head_dim=",
+            Headdim,
+            ", zipserv_smem_bytes=",
+            params.zipserv_smem_bytes,
+            ", device_limit=",
+            max_smem_per_block);
+    }
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
@@ -232,7 +311,15 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
             // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
             if (is_sm8x) {
                 if constexpr(!Is_causal) {
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                    // ZipServ decode uses the GQA swap trick, so seqlen_q is often only 8 here.
+                    // The stock 128x32 choice wastes most of the M tile and doubles the number
+                    // of K/V tile loads versus a 64x64 kernel. Prefer the squarer kernel only
+                    // for this ZipServ-specific small-seqlen regular path.
+                    if (params.has_zipserv_kv && params.seqlen_q <= 16) {
+                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                    } else {
+                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                    }
                 } else {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }

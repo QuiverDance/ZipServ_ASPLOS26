@@ -10,6 +10,7 @@
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
 
+#include <algorithm>
 #include <cutlass/numeric_types.h>
 
 #include "namespace_config.h"
@@ -22,6 +23,116 @@
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 namespace FLASH_NAMESPACE {
+
+namespace {
+
+constexpr int kZipservTileRows = 64;
+constexpr int kZipservTileCols = 64;
+constexpr int kZipservBitmapRows = kZipservTileRows / 8;
+constexpr int kZipservBitmapCols = kZipservTileCols / 8;
+constexpr int kZipservBitmapWords = kZipservBitmapRows * kZipservBitmapCols;
+constexpr int kZipservSmallTilesPerWarp = 16;
+constexpr int kZipservSharedPadding = 8;
+constexpr int kZipservWarpsPerTile = 4;
+
+size_t align_up(size_t value, size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+void check_zipserv_compressed(
+    const at::Tensor &sign_mantissa,
+    const at::Tensor &compressed_full,
+    const at::Tensor &bitmap1,
+    const at::Tensor &bitmap2,
+    const at::Tensor &bitmap3,
+    const at::Tensor &tile_offsets_median,
+    const at::Tensor &tile_offsets_global,
+    const at::Device &device) {
+    CHECK_DEVICE(sign_mantissa);
+    CHECK_DEVICE(compressed_full);
+    CHECK_DEVICE(bitmap1);
+    CHECK_DEVICE(bitmap2);
+    CHECK_DEVICE(bitmap3);
+    CHECK_DEVICE(tile_offsets_median);
+    CHECK_DEVICE(tile_offsets_global);
+    CHECK_CONTIGUOUS(sign_mantissa);
+    CHECK_CONTIGUOUS(compressed_full);
+    CHECK_CONTIGUOUS(bitmap1);
+    CHECK_CONTIGUOUS(bitmap2);
+    CHECK_CONTIGUOUS(bitmap3);
+    CHECK_CONTIGUOUS(tile_offsets_median);
+    CHECK_CONTIGUOUS(tile_offsets_global);
+    TORCH_CHECK(sign_mantissa.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(compressed_full.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(bitmap1.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(bitmap2.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(bitmap3.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(tile_offsets_median.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(tile_offsets_global.device() == device, "ZipServ metadata must be on the same device as q");
+    TORCH_CHECK(sign_mantissa.dtype() == torch::kUInt8, "ZipServ sign_mantissa must be uint8");
+    TORCH_CHECK(compressed_full.dtype() == torch::kBFloat16, "ZipServ compressed_full must be bfloat16");
+    TORCH_CHECK(bitmap1.dtype() == torch::kUInt64, "ZipServ bitmap1 must be uint64");
+    TORCH_CHECK(bitmap2.dtype() == torch::kUInt64, "ZipServ bitmap2 must be uint64");
+    TORCH_CHECK(bitmap3.dtype() == torch::kUInt64, "ZipServ bitmap3 must be uint64");
+    TORCH_CHECK(tile_offsets_median.dtype() == torch::kInt32, "ZipServ tile_offsets_median must be int32");
+    TORCH_CHECK(tile_offsets_global.dtype() == torch::kInt32, "ZipServ tile_offsets_global must be int32");
+}
+
+size_t zipserv_shared_bytes(int max_high_freq_count, int max_full_count) {
+    const size_t padded_high_freq =
+        static_cast<size_t>(max_high_freq_count + ((128 - (max_high_freq_count % 128)) % 128));
+    const size_t output_bytes =
+        align_up(static_cast<size_t>(kZipservTileRows) * (kZipservTileCols + kZipservSharedPadding) * sizeof(__nv_bfloat16), 128);
+    const size_t metadata_bytes =
+        static_cast<size_t>((2 * kZipservWarpsPerTile + kZipservWarpsPerTile * kZipservSmallTilesPerWarp) * sizeof(int));
+    const size_t per_buffer_bytes = align_up(
+        static_cast<size_t>(kZipservBitmapWords) * 3 * sizeof(uint64_t)
+            + padded_high_freq * sizeof(uint8_t)
+            + static_cast<size_t>(max_full_count) * sizeof(__nv_bfloat16)
+            + metadata_bytes,
+        128);
+    return 127
+        + output_bytes
+        + 2 * per_buffer_bytes;
+}
+
+void set_zipserv_params(
+    Flash_fwd_params &params,
+    ZipservCompressedKVParams &dst,
+    const at::Tensor &sign_mantissa,
+    const at::Tensor &compressed_full,
+    const at::Tensor &bitmap1,
+    const at::Tensor &bitmap2,
+    const at::Tensor &bitmap3,
+    const at::Tensor &tile_offsets_median,
+    const at::Tensor &tile_offsets_global,
+    const int rows,
+    const int cols,
+    const int batch_stride_rows,
+    const int head_stride_rows,
+    const int max_high_freq_count,
+    const int max_full_count,
+    const int start_exp) {
+    dst.sign_mantissa = sign_mantissa.data_ptr<uint8_t>();
+    dst.compressed_full = reinterpret_cast<const __nv_bfloat16 *>(compressed_full.data_ptr());
+    dst.bitmap1 = bitmap1.data_ptr<uint64_t>();
+    dst.bitmap2 = bitmap2.data_ptr<uint64_t>();
+    dst.bitmap3 = bitmap3.data_ptr<uint64_t>();
+    dst.tile_offsets_median = tile_offsets_median.data_ptr<int>();
+    dst.tile_offsets_global = tile_offsets_global.data_ptr<int>();
+    dst.rows = rows;
+    dst.cols = cols;
+    dst.batch_stride_rows = batch_stride_rows;
+    dst.head_stride_rows = head_stride_rows;
+    dst.max_high_freq_count = max_high_freq_count;
+    dst.max_full_count = max_full_count;
+    dst.start_exp = start_exp;
+    params.zipserv_smem_bytes = std::max<int>(
+        params.zipserv_smem_bytes,
+        static_cast<int>(zipserv_shared_bytes(max_high_freq_count, max_full_count)));
+}
+
+}  // namespace
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -241,6 +352,13 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+    #ifdef FLASHATTENTION_DISABLE_SPLITKV
+        TORCH_CHECK(
+            params.num_splits <= 1 && !force_split_kernel,
+            "This flash attention build only supports the regular decode path. "
+            "Use num_splits=1 without paged KV, cache_batch_idx, or KV append, "
+            "or rebuild with split-kv enabled.");
+    #endif
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -755,6 +873,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+#ifdef FLASHATTENTION_DISABLE_BACKWARD
+    TORCH_CHECK(false, "This flash attention build does not support backward.");
+#else
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -762,6 +883,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             });
         });
     });
+#endif
 }
 
 std::vector<at::Tensor>
@@ -785,9 +907,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         std::optional<at::Generator> gen_,
         std::optional<at::Tensor> &rng_state) {
 
-    #ifdef FLASHATTENTION_DISABLE_BACKWARD
-        TORCH_CHECK(false, "This flash attention build does not support backward.");
-    #endif
+#ifdef FLASHATTENTION_DISABLE_BACKWARD
+    TORCH_CHECK(false, "This flash attention build does not support backward.");
+#else
     if (is_causal) { window_size_right = 0; }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -968,6 +1090,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     }
 
     return { dq, dk, dv, softmax_d };
+#endif
 }
 
 std::vector<at::Tensor>
@@ -996,9 +1119,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                std::optional<at::Generator> gen_,
                std::optional<at::Tensor> &rng_state) {
 
-    #ifdef FLASHATTENTION_DISABLE_BACKWARD
-        TORCH_CHECK(false, "This flash attention build does not support backward.");
-    #endif
+#ifdef FLASHATTENTION_DISABLE_BACKWARD
+    TORCH_CHECK(false, "This flash attention build does not support backward.");
+#else
     if (is_causal) { window_size_right = 0; }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1197,30 +1320,58 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     return { dq, dk, dv, softmax_d };
+#endif
 }
 
 std::vector<at::Tensor>
-mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
-                const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                std::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
-                std::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
-                std::optional<const at::Tensor> &seqlens_k_, // batch_size
-                std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-                std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-                std::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
-                std::optional<const at::Tensor> &leftpad_k_, // batch_size
-                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
-                std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-                std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
-                const float softmax_scale,
-                bool is_causal,
-                int window_size_left,
-                int window_size_right,
-                const float softcap,
-                bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
-                ) {
+mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
+                     const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                     const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                     std::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
+                     std::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
+                     std::optional<const at::Tensor> &seqlens_k_, // batch_size
+                     std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+                     std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+                     std::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
+                     std::optional<const at::Tensor> &leftpad_k_, // batch_size
+                     std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
+                     std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+                     std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
+                     const float softmax_scale,
+                     bool is_causal,
+                     int window_size_left,
+                     int window_size_right,
+                     const float softcap,
+                     bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+                     int num_splits,
+                     std::optional<const at::Tensor> &zipserv_k_sign_mantissa_,
+                     std::optional<const at::Tensor> &zipserv_k_compressed_full_,
+                     std::optional<const at::Tensor> &zipserv_k_bitmap1_,
+                     std::optional<const at::Tensor> &zipserv_k_bitmap2_,
+                     std::optional<const at::Tensor> &zipserv_k_bitmap3_,
+                     std::optional<const at::Tensor> &zipserv_k_tile_offsets_median_,
+                     std::optional<const at::Tensor> &zipserv_k_tile_offsets_global_,
+                     int zipserv_k_rows,
+                     int zipserv_k_cols,
+                     int zipserv_k_batch_stride_rows,
+                     int zipserv_k_head_stride_rows,
+                     int zipserv_k_max_high_freq_count,
+                     int zipserv_k_max_full_count,
+                     int zipserv_k_start_exp,
+                     std::optional<const at::Tensor> &zipserv_v_sign_mantissa_,
+                     std::optional<const at::Tensor> &zipserv_v_compressed_full_,
+                     std::optional<const at::Tensor> &zipserv_v_bitmap1_,
+                     std::optional<const at::Tensor> &zipserv_v_bitmap2_,
+                     std::optional<const at::Tensor> &zipserv_v_bitmap3_,
+                     std::optional<const at::Tensor> &zipserv_v_tile_offsets_median_,
+                     std::optional<const at::Tensor> &zipserv_v_tile_offsets_global_,
+                     int zipserv_v_rows,
+                     int zipserv_v_cols,
+                     int zipserv_v_batch_stride_rows,
+                     int zipserv_v_head_stride_rows,
+                     int zipserv_v_max_high_freq_count,
+                     int zipserv_v_max_full_count,
+                     int zipserv_v_start_exp) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -1251,6 +1402,42 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
 
+    const bool has_zipserv_k =
+        zipserv_k_sign_mantissa_.has_value() || zipserv_k_compressed_full_.has_value() ||
+        zipserv_k_bitmap1_.has_value() || zipserv_k_bitmap2_.has_value() || zipserv_k_bitmap3_.has_value() ||
+        zipserv_k_tile_offsets_median_.has_value() || zipserv_k_tile_offsets_global_.has_value();
+    const bool has_zipserv_v =
+        zipserv_v_sign_mantissa_.has_value() || zipserv_v_compressed_full_.has_value() ||
+        zipserv_v_bitmap1_.has_value() || zipserv_v_bitmap2_.has_value() || zipserv_v_bitmap3_.has_value() ||
+        zipserv_v_tile_offsets_median_.has_value() || zipserv_v_tile_offsets_global_.has_value();
+    TORCH_CHECK(has_zipserv_k == has_zipserv_v, "ZipServ K and V metadata must either both be present or both be absent");
+    const bool zipserv_kv = has_zipserv_k && has_zipserv_v;
+    #ifdef FLASHATTENTION_DISABLE_SPLITKV
+        TORCH_CHECK(!k_.has_value() && !v_.has_value(), "This flash attention build does not support KV append.");
+        TORCH_CHECK(!cache_batch_idx_.has_value(), "This flash attention build does not support cache_batch_idx.");
+        TORCH_CHECK(!paged_KV, "This flash attention build does not support paged KV cache.");
+        TORCH_CHECK(num_splits == 1, "This flash attention build requires num_splits=1 for the regular decode path.");
+    #endif
+    if (zipserv_kv) {
+        TORCH_CHECK(
+            zipserv_k_sign_mantissa_.has_value() && zipserv_k_compressed_full_.has_value() &&
+            zipserv_k_bitmap1_.has_value() && zipserv_k_bitmap2_.has_value() && zipserv_k_bitmap3_.has_value() &&
+            zipserv_k_tile_offsets_median_.has_value() && zipserv_k_tile_offsets_global_.has_value(),
+            "ZipServ K metadata is incomplete");
+        TORCH_CHECK(
+            zipserv_v_sign_mantissa_.has_value() && zipserv_v_compressed_full_.has_value() &&
+            zipserv_v_bitmap1_.has_value() && zipserv_v_bitmap2_.has_value() && zipserv_v_bitmap3_.has_value() &&
+            zipserv_v_tile_offsets_median_.has_value() && zipserv_v_tile_offsets_global_.has_value(),
+            "ZipServ V metadata is incomplete");
+        TORCH_CHECK(q_dtype == torch::kBFloat16, "ZipServ KV path currently requires bf16 query / output tensors");
+        TORCH_CHECK(!paged_KV, "ZipServ KV path does not support paged KV cache in this integration");
+        TORCH_CHECK(!k_.has_value() && !v_.has_value(), "ZipServ KV path does not support in-place KV append");
+        TORCH_CHECK(!rotary_cos_.has_value() && !rotary_sin_.has_value(), "ZipServ KV path does not support rotary append");
+        TORCH_CHECK(!leftpad_k_.has_value(), "ZipServ KV path does not support cache_leftpad");
+        TORCH_CHECK(kcache.stride(-1) == 1 && vcache.stride(-1) == 1, "ZipServ placeholders must be contiguous");
+    } else {
+    }
+
     const auto sizes = q.sizes();
 
     const int batch_size = sizes[0];
@@ -1262,9 +1449,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
-    const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
+    const int seqlen_k = zipserv_kv
+        ? zipserv_k_head_stride_rows
+        : (!paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size);
     const int num_heads_k = kcache.size(2);
-    const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
+    const int batch_size_c = zipserv_kv
+        ? std::max(1, zipserv_k_rows / std::max(1, zipserv_k_batch_stride_rows))
+        : (!paged_KV ? kcache.size(0) : batch_size);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
@@ -1275,8 +1466,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    // Keep ZipServ on the original integrated split-kv path, but still reuse the dense decode
-    // remapping that makes one CTA own one KV head and multiple Q heads in its GQA group.
     const int seqlenq_ngroups_swapped =
         seqlen_q == 1 &&
         num_heads > num_heads_k &&
@@ -1295,7 +1484,29 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
-    if (!paged_KV) {
+    if (zipserv_kv) {
+        TORCH_CHECK(head_size_og % 8 == 0, "ZipServ KV path requires head_size to be a multiple of 8");
+        TORCH_CHECK(zipserv_k_head_stride_rows > 0 && zipserv_k_head_stride_rows % 64 == 0,
+            "ZipServ K metadata head_stride_rows must be a positive multiple of 64");
+        TORCH_CHECK(zipserv_v_head_stride_rows == zipserv_k_head_stride_rows,
+            "ZipServ K/V metadata must agree on head_stride_rows");
+        TORCH_CHECK(zipserv_k_batch_stride_rows > 0 && zipserv_k_batch_stride_rows % zipserv_k_head_stride_rows == 0,
+            "ZipServ K metadata batch_stride_rows must be a multiple of head_stride_rows");
+        TORCH_CHECK(zipserv_v_batch_stride_rows == zipserv_k_batch_stride_rows,
+            "ZipServ K/V metadata must agree on batch_stride_rows");
+        TORCH_CHECK(zipserv_k_cols % 64 == 0 && zipserv_v_cols % 64 == 0,
+            "ZipServ K/V metadata cols must be multiples of 64");
+        TORCH_CHECK(zipserv_k_cols >= head_size_og && zipserv_v_cols >= head_size_og,
+            "ZipServ compressed cols must cover the padded head size");
+        TORCH_CHECK(zipserv_k_rows == batch_size_c * zipserv_k_batch_stride_rows,
+            "ZipServ K rows must equal batch_size_cache * batch_stride_rows");
+        TORCH_CHECK(zipserv_v_rows == batch_size_c * zipserv_v_batch_stride_rows,
+            "ZipServ V rows must equal batch_size_cache * batch_stride_rows");
+        TORCH_CHECK(zipserv_k_batch_stride_rows / zipserv_k_head_stride_rows == num_heads_k,
+            "ZipServ K layout must encode one contiguous row-stride slab per KV head");
+        TORCH_CHECK(zipserv_v_batch_stride_rows / zipserv_v_head_stride_rows == num_heads_k,
+            "ZipServ V layout must encode one contiguous row-stride slab per KV head");
+    } else if (!paged_KV) {
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
         CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
     } else {
@@ -1307,8 +1518,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor q_padded, kcache_padded, vcache_padded;
     if (head_size_og % 8 != 0) {
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        if (!zipserv_kv) {
+            kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+            vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        } else {
+            kcache_padded = kcache;
+            vcache_padded = vcache;
+        }
     } else {
         q_padded = q;
         kcache_padded = kcache;
@@ -1449,12 +1665,81 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()), opts);
-
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
     }
     params.page_block_size = page_block_size;
+    if (zipserv_kv) {
+        const auto &zipserv_k_sign_mantissa = zipserv_k_sign_mantissa_.value();
+        const auto &zipserv_k_compressed_full = zipserv_k_compressed_full_.value();
+        const auto &zipserv_k_bitmap1 = zipserv_k_bitmap1_.value();
+        const auto &zipserv_k_bitmap2 = zipserv_k_bitmap2_.value();
+        const auto &zipserv_k_bitmap3 = zipserv_k_bitmap3_.value();
+        const auto &zipserv_k_tile_offsets_median = zipserv_k_tile_offsets_median_.value();
+        const auto &zipserv_k_tile_offsets_global = zipserv_k_tile_offsets_global_.value();
+        const auto &zipserv_v_sign_mantissa = zipserv_v_sign_mantissa_.value();
+        const auto &zipserv_v_compressed_full = zipserv_v_compressed_full_.value();
+        const auto &zipserv_v_bitmap1 = zipserv_v_bitmap1_.value();
+        const auto &zipserv_v_bitmap2 = zipserv_v_bitmap2_.value();
+        const auto &zipserv_v_bitmap3 = zipserv_v_bitmap3_.value();
+        const auto &zipserv_v_tile_offsets_median = zipserv_v_tile_offsets_median_.value();
+        const auto &zipserv_v_tile_offsets_global = zipserv_v_tile_offsets_global_.value();
+
+        check_zipserv_compressed(
+            zipserv_k_sign_mantissa,
+            zipserv_k_compressed_full,
+            zipserv_k_bitmap1,
+            zipserv_k_bitmap2,
+            zipserv_k_bitmap3,
+            zipserv_k_tile_offsets_median,
+            zipserv_k_tile_offsets_global,
+            q.device());
+        check_zipserv_compressed(
+            zipserv_v_sign_mantissa,
+            zipserv_v_compressed_full,
+            zipserv_v_bitmap1,
+            zipserv_v_bitmap2,
+            zipserv_v_bitmap3,
+            zipserv_v_tile_offsets_median,
+            zipserv_v_tile_offsets_global,
+            q.device());
+        set_zipserv_params(
+            params,
+            params.zipserv_k,
+            zipserv_k_sign_mantissa,
+            zipserv_k_compressed_full,
+            zipserv_k_bitmap1,
+            zipserv_k_bitmap2,
+            zipserv_k_bitmap3,
+            zipserv_k_tile_offsets_median,
+            zipserv_k_tile_offsets_global,
+            zipserv_k_rows,
+            zipserv_k_cols,
+            zipserv_k_batch_stride_rows,
+            zipserv_k_head_stride_rows,
+            zipserv_k_max_high_freq_count,
+            zipserv_k_max_full_count,
+            zipserv_k_start_exp);
+        set_zipserv_params(
+            params,
+            params.zipserv_v,
+            zipserv_v_sign_mantissa,
+            zipserv_v_compressed_full,
+            zipserv_v_bitmap1,
+            zipserv_v_bitmap2,
+            zipserv_v_bitmap3,
+            zipserv_v_tile_offsets_median,
+            zipserv_v_tile_offsets_global,
+            zipserv_v_rows,
+            zipserv_v_cols,
+            zipserv_v_batch_stride_rows,
+            zipserv_v_head_stride_rows,
+            zipserv_v_max_high_freq_count,
+            zipserv_v_max_full_count,
+            zipserv_v_start_exp);
+        params.has_zipserv_kv = true;
+    }
 
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
@@ -1462,7 +1747,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
-    run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+    run_mha_fwd(
+        params,
+        stream,
+        /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
 
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
@@ -1480,6 +1768,106 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, softmax_lse};
+}
+
+std::vector<at::Tensor>
+mha_fwd_kvcache(at::Tensor &q,
+                const at::Tensor &kcache,
+                const at::Tensor &vcache,
+                std::optional<const at::Tensor> &k_,
+                std::optional<const at::Tensor> &v_,
+                std::optional<const at::Tensor> &seqlens_k_,
+                std::optional<const at::Tensor> &rotary_cos_,
+                std::optional<const at::Tensor> &rotary_sin_,
+                std::optional<const at::Tensor> &cache_batch_idx_,
+                std::optional<const at::Tensor> &leftpad_k_,
+                std::optional<at::Tensor> &block_table_,
+                std::optional<at::Tensor> &alibi_slopes_,
+                std::optional<at::Tensor> &out_,
+                const float softmax_scale,
+                bool is_causal,
+                int window_size_left,
+                int window_size_right,
+                const float softcap,
+                bool is_rotary_interleaved,
+                int num_splits,
+                std::optional<const at::Tensor> &zipserv_k_sign_mantissa_,
+                std::optional<const at::Tensor> &zipserv_k_compressed_full_,
+                std::optional<const at::Tensor> &zipserv_k_bitmap1_,
+                std::optional<const at::Tensor> &zipserv_k_bitmap2_,
+                std::optional<const at::Tensor> &zipserv_k_bitmap3_,
+                std::optional<const at::Tensor> &zipserv_k_tile_offsets_median_,
+                std::optional<const at::Tensor> &zipserv_k_tile_offsets_global_,
+                int zipserv_k_rows,
+                int zipserv_k_cols,
+                int zipserv_k_batch_stride_rows,
+                int zipserv_k_head_stride_rows,
+                int zipserv_k_max_high_freq_count,
+                int zipserv_k_max_full_count,
+                int zipserv_k_start_exp,
+                std::optional<const at::Tensor> &zipserv_v_sign_mantissa_,
+                std::optional<const at::Tensor> &zipserv_v_compressed_full_,
+                std::optional<const at::Tensor> &zipserv_v_bitmap1_,
+                std::optional<const at::Tensor> &zipserv_v_bitmap2_,
+                std::optional<const at::Tensor> &zipserv_v_bitmap3_,
+                std::optional<const at::Tensor> &zipserv_v_tile_offsets_median_,
+                std::optional<const at::Tensor> &zipserv_v_tile_offsets_global_,
+                int zipserv_v_rows,
+                int zipserv_v_cols,
+                int zipserv_v_batch_stride_rows,
+                int zipserv_v_head_stride_rows,
+                int zipserv_v_max_high_freq_count,
+                int zipserv_v_max_full_count,
+                int zipserv_v_start_exp) {
+    return mha_fwd_kvcache_impl(
+        q,
+        kcache,
+        vcache,
+        k_,
+        v_,
+        seqlens_k_,
+        rotary_cos_,
+        rotary_sin_,
+        cache_batch_idx_,
+        leftpad_k_,
+        block_table_,
+        alibi_slopes_,
+        out_,
+        softmax_scale,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        num_splits,
+        zipserv_k_sign_mantissa_,
+        zipserv_k_compressed_full_,
+        zipserv_k_bitmap1_,
+        zipserv_k_bitmap2_,
+        zipserv_k_bitmap3_,
+        zipserv_k_tile_offsets_median_,
+        zipserv_k_tile_offsets_global_,
+        zipserv_k_rows,
+        zipserv_k_cols,
+        zipserv_k_batch_stride_rows,
+        zipserv_k_head_stride_rows,
+        zipserv_k_max_high_freq_count,
+        zipserv_k_max_full_count,
+        zipserv_k_start_exp,
+        zipserv_v_sign_mantissa_,
+        zipserv_v_compressed_full_,
+        zipserv_v_bitmap1_,
+        zipserv_v_bitmap2_,
+        zipserv_v_bitmap3_,
+        zipserv_v_tile_offsets_median_,
+        zipserv_v_tile_offsets_global_,
+        zipserv_v_rows,
+        zipserv_v_cols,
+        zipserv_v_batch_stride_rows,
+        zipserv_v_head_stride_rows,
+        zipserv_v_max_high_freq_count,
+        zipserv_v_max_full_count,
+        zipserv_v_start_exp);
 }
 } // namespace FLASH_NAMESPACE
 

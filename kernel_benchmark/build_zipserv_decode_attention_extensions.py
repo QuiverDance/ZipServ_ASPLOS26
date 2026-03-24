@@ -11,11 +11,14 @@ from torch.utils.cpp_extension import load
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 EXT_NAME = "zipserv_decode_attention_ext"
-FLASH_ATTN_EXT_NAME = "zipserv_flash_attn_ext"
+FLASH_ATTN_EXT_NAME = "flash_attn_2_cuda"
+ZIPSERV_FLASH_FUSED_EXT_NAME = "zipserv_flash_attn_ext"
 PYTHON_ABI_TAG = sys.implementation.cache_tag or f"py{sys.version_info.major}{sys.version_info.minor}"
 PREBUILT_EXT_ROOT = SCRIPT_DIR / ".prebuilt_extensions" / PYTHON_ABI_TAG
 ZIPSERV_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / EXT_NAME
 FLASH_ATTN_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / FLASH_ATTN_EXT_NAME
+FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / f"{FLASH_ATTN_EXT_NAME}_regular_only"
+ZIPSERV_FLASH_FUSED_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / ZIPSERV_FLASH_FUSED_EXT_NAME
 FLASH_ATTN_ROOT = SCRIPT_DIR / "third_party" / "flash_attn_v283"
 
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
@@ -56,10 +59,48 @@ def build_zipserv_extension(verbose: bool) -> Path | None:
     return newest_shared_object(ZIPSERV_EXT_BUILD_DIR, EXT_NAME)
 
 
-def build_zipserv_flash_attn_extension(verbose: bool) -> Path | None:
-    FLASH_ATTN_EXT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+def build_flash_attn_2_cuda_extension(verbose: bool, regular_only: bool = False) -> Path | None:
+    build_dir = FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR if regular_only else FLASH_ATTN_EXT_BUILD_DIR
+    build_dir.mkdir(parents=True, exist_ok=True)
+    flash_attn_src_dir = FLASH_ATTN_ROOT / "csrc" / "flash_attn" / "src"
+    flash_attn_patterns = ["flash_fwd_hdim*_sm80.cu"] if regular_only else ["flash_*_sm80.cu"]
+    flash_attn_sources = [
+        str(FLASH_ATTN_ROOT / "csrc" / "flash_attn" / "flash_api.cpp"),
+        *[
+            str(path)
+            for pattern in flash_attn_patterns
+            for path in sorted(flash_attn_src_dir.glob(pattern))
+        ],
+    ]
+    common_defines = ["-DFLASHATTENTION_DISABLE_BACKWARD"] if regular_only else []
     load(
         name=FLASH_ATTN_EXT_NAME,
+        sources=flash_attn_sources,
+        extra_include_paths=[
+            str(REPO_ROOT / "csrc"),
+            str(FLASH_ATTN_ROOT / "csrc" / "flash_attn"),
+            str(FLASH_ATTN_ROOT / "csrc" / "flash_attn" / "src"),
+            str(FLASH_ATTN_ROOT / "csrc" / "cutlass" / "include"),
+        ],
+        extra_cuda_cflags=[
+            "-O3",
+            "--use_fast_math",
+            "--std=c++17",
+            "-lineinfo",
+            *common_defines,
+            *([] if not regular_only else ["-DFLASHATTENTION_DISABLE_SPLITKV"]),
+        ],
+        extra_cflags=["-O3", "-std=c++17", *common_defines, *([] if not regular_only else ["-DFLASHATTENTION_DISABLE_SPLITKV"])],
+        build_directory=str(build_dir),
+        verbose=verbose,
+    )
+    return newest_shared_object(build_dir, FLASH_ATTN_EXT_NAME)
+
+
+def build_zipserv_flash_fused_extension(verbose: bool) -> Path | None:
+    ZIPSERV_FLASH_FUSED_EXT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    load(
+        name=ZIPSERV_FLASH_FUSED_EXT_NAME,
         sources=[
             str(FLASH_ATTN_ROOT / "csrc" / "flash_attn_ck" / "zipserv_flash_api.cpp"),
             str(FLASH_ATTN_ROOT / "csrc" / "flash_attn_ck" / "zipserv_fwd_kvcache.cu"),
@@ -76,26 +117,36 @@ def build_zipserv_flash_attn_extension(verbose: bool) -> Path | None:
             "-lineinfo",
         ],
         extra_cflags=["-O3", "-std=c++17"],
-        build_directory=str(FLASH_ATTN_EXT_BUILD_DIR),
+        build_directory=str(ZIPSERV_FLASH_FUSED_EXT_BUILD_DIR),
         verbose=verbose,
     )
-    return newest_shared_object(FLASH_ATTN_EXT_BUILD_DIR, FLASH_ATTN_EXT_NAME)
+    return newest_shared_object(ZIPSERV_FLASH_FUSED_EXT_BUILD_DIR, ZIPSERV_FLASH_FUSED_EXT_NAME)
 
 
 def ensure_extension_built(target: str, verbose: bool = False) -> Path | None:
     if target == "zipserv":
         return build_zipserv_extension(verbose=verbose)
     if target == "zipserv_flashattn":
-        return build_zipserv_flash_attn_extension(verbose=verbose)
+        return build_flash_attn_2_cuda_extension(verbose=verbose)
+    if target == "zipserv_flashattn_regular_only":
+        return build_flash_attn_2_cuda_extension(verbose=verbose, regular_only=True)
+    if target == "zipserv_flashattn_ck":
+        return build_zipserv_flash_fused_extension(verbose=verbose)
     if target == "all":
         build_zipserv_extension(verbose=verbose)
-        return build_zipserv_flash_attn_extension(verbose=verbose)
+        build_flash_attn_2_cuda_extension(verbose=verbose)
+        build_zipserv_flash_fused_extension(verbose=verbose)
+        return newest_shared_object(FLASH_ATTN_EXT_BUILD_DIR, FLASH_ATTN_EXT_NAME)
     raise ValueError(f"Unknown target: {target}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prebuild decode-attention benchmark extensions without running the benchmark")
-    parser.add_argument("--target", choices=["zipserv", "zipserv_flashattn", "all"], default="all")
+    parser.add_argument(
+        "--target",
+        choices=["zipserv", "zipserv_flashattn", "zipserv_flashattn_regular_only", "zipserv_flashattn_ck", "all"],
+        default="all",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -108,8 +159,14 @@ def main() -> None:
         so_path = build_zipserv_extension(verbose=args.verbose)
         print(f"{EXT_NAME}: {so_path if so_path is not None else 'built, .so path not found'}")
     if args.target in {"zipserv_flashattn", "all"}:
-        so_path = build_zipserv_flash_attn_extension(verbose=args.verbose)
+        so_path = build_flash_attn_2_cuda_extension(verbose=args.verbose)
         print(f"{FLASH_ATTN_EXT_NAME}: {so_path if so_path is not None else 'built, .so path not found'}")
+    if args.target == "zipserv_flashattn_regular_only":
+        so_path = build_flash_attn_2_cuda_extension(verbose=args.verbose, regular_only=True)
+        print(f"{FLASH_ATTN_EXT_NAME} (regular-only): {so_path if so_path is not None else 'built, .so path not found'}")
+    if args.target in {"zipserv_flashattn_ck", "all"}:
+        so_path = build_zipserv_flash_fused_extension(verbose=args.verbose)
+        print(f"{ZIPSERV_FLASH_FUSED_EXT_NAME}: {so_path if so_path is not None else 'built, .so path not found'}")
 
 
 if __name__ == "__main__":

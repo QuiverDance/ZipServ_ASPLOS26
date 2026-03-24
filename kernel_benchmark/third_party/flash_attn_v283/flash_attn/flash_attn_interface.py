@@ -20,6 +20,98 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+_ZIPSERV_FIELDS = (
+    "sign_mantissa",
+    "compressed_full",
+    "bitmap1",
+    "bitmap2",
+    "bitmap3",
+    "tile_offsets_median",
+    "tile_offsets_global",
+    "rows",
+    "cols",
+    "max_high_freq_count",
+    "max_full_count",
+    "start_exp",
+)
+
+
+def _maybe_make_zipserv_kv_placeholders(
+    q: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
+    v_cache: Optional[torch.Tensor],
+    zipserv_k,
+    zipserv_v,
+    zipserv_num_heads_k: Optional[int],
+):
+    if zipserv_k is None and zipserv_v is None:
+        if k_cache is None or v_cache is None:
+            raise ValueError("k_cache and v_cache must be provided for dense KV-cache inputs")
+        return k_cache, v_cache, int(k_cache.shape[2])
+    if zipserv_k is None or zipserv_v is None:
+        raise ValueError("zipserv_k and zipserv_v must either both be provided or both be omitted")
+    num_heads_k = int(zipserv_num_heads_k) if zipserv_num_heads_k is not None else 0
+    if num_heads_k <= 0:
+        if k_cache is not None and v_cache is not None:
+            num_heads_k = int(k_cache.shape[2])
+        else:
+            raise ValueError("zipserv_num_heads_k must be provided when zipserv_k/zipserv_v are used")
+    if k_cache is not None and v_cache is not None:
+        return k_cache, v_cache, num_heads_k
+    if k_cache is not None or v_cache is not None:
+        raise ValueError("k_cache and v_cache must either both be provided or both be omitted")
+    cache_shape = (q.shape[0], 1, num_heads_k, q.shape[-1])
+    empty_cache = torch.empty(cache_shape, dtype=q.dtype, device=q.device)
+    return empty_cache, torch.empty_like(empty_cache), num_heads_k
+
+
+def _normalize_zipserv_kv(
+    desc: Optional[object],
+    *,
+    name: str,
+    device: torch.device,
+    batch_size: int,
+    num_heads_k: int,
+):
+    if desc is None:
+        return None
+    if isinstance(desc, dict):
+        values = tuple(desc[field] for field in _ZIPSERV_FIELDS)
+    elif isinstance(desc, Sequence) and not isinstance(desc, (str, bytes)):
+        if len(desc) != len(_ZIPSERV_FIELDS):
+            raise ValueError(f"{name} must have {len(_ZIPSERV_FIELDS)} elements")
+        values = tuple(desc)
+    else:
+        values = tuple(getattr(desc, field) for field in _ZIPSERV_FIELDS)
+
+    tensors = []
+    for field, value in zip(_ZIPSERV_FIELDS[:7], values[:7]):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name}.{field} must be a torch.Tensor")
+        if value.device != device:
+            raise ValueError(f"{name}.{field} must be on {device}")
+        tensors.append(maybe_contiguous(value))
+
+    rows, cols, max_high_freq_count, max_full_count, start_exp = (int(value) for value in values[7:])
+    if batch_size <= 0 or num_heads_k <= 0:
+        raise ValueError("batch_size and num_heads_k must be positive")
+    if rows % batch_size != 0:
+        raise ValueError(f"{name}.rows must be divisible by batch_size={batch_size}")
+    batch_stride_rows = rows // batch_size
+    if batch_stride_rows % num_heads_k != 0:
+        raise ValueError(f"{name}.rows must encode an integer rows-per-head for num_heads_k={num_heads_k}")
+    head_stride_rows = batch_stride_rows // num_heads_k
+    return tuple(tensors) + (
+        rows,
+        cols,
+        batch_stride_rows,
+        head_stride_rows,
+        max_high_freq_count,
+        max_full_count,
+        start_exp,
+    )
+
+
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
     assert head_dim <= 256
@@ -1481,6 +1573,9 @@ def flash_attn_with_kvcache(
     alibi_slopes=None,
     num_splits=0,
     return_softmax_lse=False,
+    zipserv_k=None,
+    zipserv_v=None,
+    zipserv_num_heads_k: Optional[int] = None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1562,6 +1657,15 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        zipserv_k [optional]: ZipServ-compressed K metadata. Accepts a dict/object/sequence with
+            fields `sign_mantissa`, `compressed_full`, `bitmap1`, `bitmap2`, `bitmap3`,
+            `tile_offsets_median`, `tile_offsets_global`, `rows`, `cols`,
+            `max_high_freq_count`, `max_full_count`, `start_exp`. When provided together with
+            `zipserv_v` and `zipserv_num_heads_k`, the compressed decode path is handled inside
+            `flash_attn_2_cuda`'s split-kv kernel without materializing a dense KV cache.
+        zipserv_v [optional]: ZipServ-compressed V metadata with the same schema as `zipserv_k`.
+        zipserv_num_heads_k [optional]: Number of KV heads represented by the ZipServ metadata.
+            Required when `zipserv_k` / `zipserv_v` are used without dense cache placeholders.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -1569,9 +1673,34 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if block_table is not None and (zipserv_k is not None or zipserv_v is not None):
+        raise ValueError("zipserv_k / zipserv_v integration does not support block_table")
+    k_cache, v_cache, zipserv_num_heads_k = _maybe_make_zipserv_kv_placeholders(
+        q,
+        k_cache,
+        v_cache,
+        zipserv_k,
+        zipserv_v,
+        zipserv_num_heads_k,
+    )
+    zipserv_batch_size = int(k_cache.shape[0]) if k_cache is not None else q.shape[0]
+    zipserv_k = _normalize_zipserv_kv(
+        zipserv_k,
+        name="zipserv_k",
+        device=q.device,
+        batch_size=zipserv_batch_size,
+        num_heads_k=zipserv_num_heads_k,
+    )
+    zipserv_v = _normalize_zipserv_kv(
+        zipserv_v,
+        name="zipserv_v",
+        device=q.device,
+        batch_size=zipserv_batch_size,
+        num_heads_k=zipserv_num_heads_k,
+    )
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
@@ -1580,7 +1709,11 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    cache_leftpad = maybe_contiguous(cache_leftpad)
     block_table = maybe_contiguous(block_table)
+    zipserv_args = ((None,) * 7 + (0,) * 7) * 2
+    if zipserv_k is not None:
+        zipserv_args = (*zipserv_k, *zipserv_v)
     out, softmax_lse = flash_attn_gpu.fwd_kvcache(
         q,
         k_cache,
@@ -1602,5 +1735,6 @@ def flash_attn_with_kvcache(
         softcap,
         rotary_interleaved,
         num_splits,
+        *zipserv_args,
     )
     return (out, softmax_lse) if return_softmax_lse else out

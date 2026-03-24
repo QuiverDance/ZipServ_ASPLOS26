@@ -68,11 +68,143 @@ torch::Tensor zipserv_decode_attention_cuda(
     int64_t head_dim,
     double sm_scale);
 
+torch::Tensor zipserv_decode_attention_online_cuda(
+    torch::Tensor q,
+    torch::Tensor k_sign_mantissa,
+    torch::Tensor k_compressed_full,
+    torch::Tensor k_bitmap1,
+    torch::Tensor k_bitmap2,
+    torch::Tensor k_bitmap3,
+    torch::Tensor k_tile_offsets_median,
+    torch::Tensor k_tile_offsets_global,
+    int64_t k_rows,
+    int64_t k_cols,
+    int64_t k_batch_stride_rows,
+    int64_t k_head_stride_rows,
+    int64_t k_max_high_freq_count,
+    int64_t k_max_full_count,
+    int64_t k_start_exp,
+    torch::Tensor v_sign_mantissa,
+    torch::Tensor v_compressed_full,
+    torch::Tensor v_bitmap1,
+    torch::Tensor v_bitmap2,
+    torch::Tensor v_bitmap3,
+    torch::Tensor v_tile_offsets_median,
+    torch::Tensor v_tile_offsets_global,
+    int64_t v_rows,
+    int64_t v_cols,
+    int64_t v_batch_stride_rows,
+    int64_t v_head_stride_rows,
+    int64_t v_max_high_freq_count,
+    int64_t v_max_full_count,
+    int64_t v_start_exp,
+    int64_t logical_kv_len,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    double sm_scale);
+
+void CheckZipservCompressed(
+    const torch::Tensor& sign_mantissa,
+    const torch::Tensor& compressed_full,
+    const torch::Tensor& bitmap1,
+    const torch::Tensor& bitmap2,
+    const torch::Tensor& bitmap3,
+    const torch::Tensor& tile_offsets_median,
+    const torch::Tensor& tile_offsets_global);
+
 namespace {
 
 void CheckCudaTensor(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void CheckZipservDecodeAttentionInputs(
+    const torch::Tensor& q,
+    const torch::Tensor& k_sign_mantissa,
+    const torch::Tensor& k_compressed_full,
+    const torch::Tensor& k_bitmap1,
+    const torch::Tensor& k_bitmap2,
+    const torch::Tensor& k_bitmap3,
+    const torch::Tensor& k_tile_offsets_median,
+    const torch::Tensor& k_tile_offsets_global,
+    const torch::Tensor& v_sign_mantissa,
+    const torch::Tensor& v_compressed_full,
+    const torch::Tensor& v_bitmap1,
+    const torch::Tensor& v_bitmap2,
+    const torch::Tensor& v_bitmap3,
+    const torch::Tensor& v_tile_offsets_median,
+    const torch::Tensor& v_tile_offsets_global,
+    int64_t num_q_heads,
+    int64_t head_dim) {
+    CheckCudaTensor(q, "q");
+    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
+    TORCH_CHECK(q.dim() == 2, "q must be 2D");
+    TORCH_CHECK(q.size(0) == num_q_heads, "q rows must match num_q_heads");
+    TORCH_CHECK(q.size(1) == head_dim, "q cols must match head_dim");
+    CheckZipservCompressed(
+        k_sign_mantissa,
+        k_compressed_full,
+        k_bitmap1,
+        k_bitmap2,
+        k_bitmap3,
+        k_tile_offsets_median,
+        k_tile_offsets_global);
+    CheckZipservCompressed(
+        v_sign_mantissa,
+        v_compressed_full,
+        v_bitmap1,
+        v_bitmap2,
+        v_bitmap3,
+        v_tile_offsets_median,
+        v_tile_offsets_global);
+}
+
+void CheckZipservDecodeAttentionOnlineInputs(
+    const torch::Tensor& q,
+    const torch::Tensor& k_sign_mantissa,
+    const torch::Tensor& k_compressed_full,
+    const torch::Tensor& k_bitmap1,
+    const torch::Tensor& k_bitmap2,
+    const torch::Tensor& k_bitmap3,
+    const torch::Tensor& k_tile_offsets_median,
+    const torch::Tensor& k_tile_offsets_global,
+    const torch::Tensor& v_sign_mantissa,
+    const torch::Tensor& v_compressed_full,
+    const torch::Tensor& v_bitmap1,
+    const torch::Tensor& v_bitmap2,
+    const torch::Tensor& v_bitmap3,
+    const torch::Tensor& v_tile_offsets_median,
+    const torch::Tensor& v_tile_offsets_global,
+    int64_t num_q_heads,
+    int64_t head_dim) {
+    CheckCudaTensor(q, "q");
+    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
+    TORCH_CHECK(q.dim() == 2 || q.dim() == 3, "q must be 2D or 3D");
+    if (q.dim() == 2) {
+        TORCH_CHECK(q.size(0) == num_q_heads, "q rows must match num_q_heads");
+        TORCH_CHECK(q.size(1) == head_dim, "q cols must match head_dim");
+    } else {
+        TORCH_CHECK(q.size(1) == num_q_heads, "q heads must match num_q_heads");
+        TORCH_CHECK(q.size(2) == head_dim, "q cols must match head_dim");
+    }
+    CheckZipservCompressed(
+        k_sign_mantissa,
+        k_compressed_full,
+        k_bitmap1,
+        k_bitmap2,
+        k_bitmap3,
+        k_tile_offsets_median,
+        k_tile_offsets_global);
+    CheckZipservCompressed(
+        v_sign_mantissa,
+        v_compressed_full,
+        v_bitmap1,
+        v_bitmap2,
+        v_bitmap3,
+        v_tile_offsets_median,
+        v_tile_offsets_global);
 }
 
 }  // namespace
@@ -228,27 +360,24 @@ torch::Tensor zipserv_decode_attention(
     int64_t num_kv_heads,
     int64_t head_dim,
     double sm_scale) {
-    CheckCudaTensor(q, "q");
-    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
-    TORCH_CHECK(q.dim() == 2, "q must be 2D");
-    TORCH_CHECK(q.size(0) == num_q_heads, "q rows must match num_q_heads");
-    TORCH_CHECK(q.size(1) == head_dim, "q cols must match head_dim");
-    CheckZipservCompressed(
+    CheckZipservDecodeAttentionInputs(
+        q,
         k_sign_mantissa,
         k_compressed_full,
         k_bitmap1,
         k_bitmap2,
         k_bitmap3,
         k_tile_offsets_median,
-        k_tile_offsets_global);
-    CheckZipservCompressed(
+        k_tile_offsets_global,
         v_sign_mantissa,
         v_compressed_full,
         v_bitmap1,
         v_bitmap2,
         v_bitmap3,
         v_tile_offsets_median,
-        v_tile_offsets_global);
+        v_tile_offsets_global,
+        num_q_heads,
+        head_dim);
     return zipserv_decode_attention_cuda(
         q,
         k_sign_mantissa,
@@ -282,9 +411,192 @@ torch::Tensor zipserv_decode_attention(
         sm_scale);
 }
 
+torch::Tensor zipserv_decode_attention_online(
+    torch::Tensor q,
+    torch::Tensor k_sign_mantissa,
+    torch::Tensor k_compressed_full,
+    torch::Tensor k_bitmap1,
+    torch::Tensor k_bitmap2,
+    torch::Tensor k_bitmap3,
+    torch::Tensor k_tile_offsets_median,
+    torch::Tensor k_tile_offsets_global,
+    int64_t k_rows,
+    int64_t k_cols,
+    int64_t k_batch_stride_rows,
+    int64_t k_head_stride_rows,
+    int64_t k_max_high_freq_count,
+    int64_t k_max_full_count,
+    int64_t k_start_exp,
+    torch::Tensor v_sign_mantissa,
+    torch::Tensor v_compressed_full,
+    torch::Tensor v_bitmap1,
+    torch::Tensor v_bitmap2,
+    torch::Tensor v_bitmap3,
+    torch::Tensor v_tile_offsets_median,
+    torch::Tensor v_tile_offsets_global,
+    int64_t v_rows,
+    int64_t v_cols,
+    int64_t v_batch_stride_rows,
+    int64_t v_head_stride_rows,
+    int64_t v_max_high_freq_count,
+    int64_t v_max_full_count,
+    int64_t v_start_exp,
+    int64_t logical_kv_len,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    double sm_scale) {
+    CheckZipservDecodeAttentionOnlineInputs(
+        q,
+        k_sign_mantissa,
+        k_compressed_full,
+        k_bitmap1,
+        k_bitmap2,
+        k_bitmap3,
+        k_tile_offsets_median,
+        k_tile_offsets_global,
+        v_sign_mantissa,
+        v_compressed_full,
+        v_bitmap1,
+        v_bitmap2,
+        v_bitmap3,
+        v_tile_offsets_median,
+        v_tile_offsets_global,
+        num_q_heads,
+        head_dim);
+    return zipserv_decode_attention_online_cuda(
+        q,
+        k_sign_mantissa,
+        k_compressed_full,
+        k_bitmap1,
+        k_bitmap2,
+        k_bitmap3,
+        k_tile_offsets_median,
+        k_tile_offsets_global,
+        k_rows,
+        k_cols,
+        k_batch_stride_rows,
+        k_head_stride_rows,
+        k_max_high_freq_count,
+        k_max_full_count,
+        k_start_exp,
+        v_sign_mantissa,
+        v_compressed_full,
+        v_bitmap1,
+        v_bitmap2,
+        v_bitmap3,
+        v_tile_offsets_median,
+        v_tile_offsets_global,
+        v_rows,
+        v_cols,
+        v_batch_stride_rows,
+        v_head_stride_rows,
+        v_max_high_freq_count,
+        v_max_full_count,
+        v_start_exp,
+        logical_kv_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale);
+}
+
+torch::Tensor zipserv_decode_attention_online_batched(
+    torch::Tensor q,
+    torch::Tensor k_sign_mantissa,
+    torch::Tensor k_compressed_full,
+    torch::Tensor k_bitmap1,
+    torch::Tensor k_bitmap2,
+    torch::Tensor k_bitmap3,
+    torch::Tensor k_tile_offsets_median,
+    torch::Tensor k_tile_offsets_global,
+    int64_t k_rows,
+    int64_t k_cols,
+    int64_t k_batch_stride_rows,
+    int64_t k_head_stride_rows,
+    int64_t k_max_high_freq_count,
+    int64_t k_max_full_count,
+    int64_t k_start_exp,
+    torch::Tensor v_sign_mantissa,
+    torch::Tensor v_compressed_full,
+    torch::Tensor v_bitmap1,
+    torch::Tensor v_bitmap2,
+    torch::Tensor v_bitmap3,
+    torch::Tensor v_tile_offsets_median,
+    torch::Tensor v_tile_offsets_global,
+    int64_t v_rows,
+    int64_t v_cols,
+    int64_t v_batch_stride_rows,
+    int64_t v_head_stride_rows,
+    int64_t v_max_high_freq_count,
+    int64_t v_max_full_count,
+    int64_t v_start_exp,
+    int64_t logical_kv_len,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    double sm_scale) {
+    CheckZipservDecodeAttentionOnlineInputs(
+        q,
+        k_sign_mantissa,
+        k_compressed_full,
+        k_bitmap1,
+        k_bitmap2,
+        k_bitmap3,
+        k_tile_offsets_median,
+        k_tile_offsets_global,
+        v_sign_mantissa,
+        v_compressed_full,
+        v_bitmap1,
+        v_bitmap2,
+        v_bitmap3,
+        v_tile_offsets_median,
+        v_tile_offsets_global,
+        num_q_heads,
+        head_dim);
+    TORCH_CHECK(q.dim() == 3, "zipserv_decode_attention_online_batched requires q to be 3D");
+    return zipserv_decode_attention_online_cuda(
+        q,
+        k_sign_mantissa,
+        k_compressed_full,
+        k_bitmap1,
+        k_bitmap2,
+        k_bitmap3,
+        k_tile_offsets_median,
+        k_tile_offsets_global,
+        k_rows,
+        k_cols,
+        k_batch_stride_rows,
+        k_head_stride_rows,
+        k_max_high_freq_count,
+        k_max_full_count,
+        k_start_exp,
+        v_sign_mantissa,
+        v_compressed_full,
+        v_bitmap1,
+        v_bitmap2,
+        v_bitmap3,
+        v_tile_offsets_median,
+        v_tile_offsets_global,
+        v_rows,
+        v_cols,
+        v_batch_stride_rows,
+        v_head_stride_rows,
+        v_max_high_freq_count,
+        v_max_full_count,
+        v_start_exp,
+        logical_kv_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compress_zipserv", &compress_zipserv, "Compress a padded BF16 2D tensor with ZipServ");
     m.def("decompress_zipserv", &decompress_zipserv, "Decompress a ZipServ payload into a dense BF16 tensor");
     m.def("decompress_zipserv_into", &decompress_zipserv_into, "Decompress a ZipServ payload into a provided dense BF16 tensor");
     m.def("zipserv_decode_attention", &zipserv_decode_attention, "Run decode attention directly from ZipServ-compressed K/V");
+    m.def("zipserv_decode_attention_online", &zipserv_decode_attention_online, "Run fused online decode attention directly from ZipServ-compressed K/V");
+    m.def("zipserv_decode_attention_online_batched", &zipserv_decode_attention_online_batched, "Run fused online decode attention over a batch directly from ZipServ-compressed K/V");
 }

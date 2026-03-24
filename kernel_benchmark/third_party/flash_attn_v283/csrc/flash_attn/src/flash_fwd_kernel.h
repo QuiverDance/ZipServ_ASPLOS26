@@ -9,6 +9,8 @@
 
 #include <cute/tensor.hpp>
 
+#include <cstdint>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
@@ -20,10 +22,330 @@
 #include "mask.h"
 #include "dropout.h"
 #include "rotary.h"
+#include "../../../../../../csrc/MatMulUtilities.cuh"
+#include "../../../../../../csrc/L_Kernel.cuh"
 
 namespace FLASH_NAMESPACE {
 
 using namespace cute;
+
+using ZipservFlashConfig = TilingConfigBF16TripleBitmap<4, 1, 4>;
+
+constexpr int kZipservWarpsPerTile = 4;
+constexpr int kZipservSmallTilesPerWarp = 16;
+
+template <typename Element>
+__forceinline__ __device__ Element zipserv_zero_element() {
+    return Element(0.f);
+}
+
+template <typename Element>
+__forceinline__ __device__ Element zipserv_convert_element(const __nv_bfloat16 value) {
+    return Element(__bfloat162float(value));
+}
+
+__forceinline__ __device__ int zipserv_valid_rows(const int total_rows, const int row_start, const int tile_rows) {
+    return max(0, min(tile_rows, total_rows - row_start));
+}
+
+__forceinline__ __device__ size_t zipserv_align_up(const size_t value, const size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+__forceinline__ __device__ size_t zipserv_padded_high_freq_count(const ZipservCompressedKVParams &comp) {
+    return static_cast<size_t>(comp.max_high_freq_count + ((128 - (comp.max_high_freq_count % 128)) % 128));
+}
+
+struct ZipservScratchBufferView {
+    uint64_t *bitmap1;
+    uint64_t *bitmap2;
+    uint64_t *bitmap3;
+    uint8_t *sign_mantissa;
+    __nv_bfloat16 *full_values;
+    int *warp_hf_base;
+    int *warp_full_base;
+    int *small_hf_prefix;
+};
+
+struct ZipservGlobalTileInfo {
+    int global_tile_idx;
+    int global_hf_start;
+    int global_full_start;
+};
+
+__forceinline__ __device__ size_t zipserv_output_buffer_bytes() {
+    return static_cast<size_t>(64 * (64 + PADDING_SHARED_MEM_FOR_DECOMP) * sizeof(__nv_bfloat16));
+}
+
+__forceinline__ __device__ size_t zipserv_scratch_buffer_bytes(const ZipservCompressedKVParams &comp) {
+    constexpr size_t kMetadataBytes =
+        static_cast<size_t>((2 * kZipservWarpsPerTile + kZipservWarpsPerTile * kZipservSmallTilesPerWarp) * sizeof(int));
+    const size_t bitmap_bytes =
+        static_cast<size_t>(ZipservFlashConfig::TILE_BITMAP_M_V3 * ZipservFlashConfig::TILE_BITMAP_K_V3 * 3) * sizeof(uint64_t);
+    const size_t payload_bytes =
+        bitmap_bytes + zipserv_padded_high_freq_count(comp) + static_cast<size_t>(comp.max_full_count) * sizeof(__nv_bfloat16) + kMetadataBytes;
+    return zipserv_align_up(payload_bytes, 128);
+}
+
+__forceinline__ __device__ __nv_bfloat16 (*zipserv_get_output_buffer(char *zipserv_smem))[64 + PADDING_SHARED_MEM_FOR_DECOMP] {
+    return reinterpret_cast<__nv_bfloat16 (*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(zipserv_smem);
+}
+
+__forceinline__ __device__ ZipservScratchBufferView zipserv_get_scratch_buffer(
+    const ZipservCompressedKVParams &comp,
+    char *zipserv_smem,
+    const int buffer_idx) {
+    const size_t bitmap_size = ZipservFlashConfig::TILE_BITMAP_M_V3 * ZipservFlashConfig::TILE_BITMAP_K_V3;
+    char *buffer_base =
+        zipserv_smem
+        + zipserv_align_up(zipserv_output_buffer_bytes(), 128)
+        + buffer_idx * zipserv_scratch_buffer_bytes(comp);
+    auto *bitmap1 = reinterpret_cast<uint64_t *>(buffer_base);
+    auto *bitmap2 = bitmap1 + bitmap_size;
+    auto *bitmap3 = bitmap2 + bitmap_size;
+    auto *sign_mantissa = reinterpret_cast<uint8_t *>(bitmap3 + bitmap_size);
+    auto *full_values =
+        reinterpret_cast<__nv_bfloat16 *>(sign_mantissa + zipserv_padded_high_freq_count(comp));
+    auto *warp_hf_base = reinterpret_cast<int *>(full_values + comp.max_full_count);
+    auto *warp_full_base = warp_hf_base + kZipservWarpsPerTile;
+    auto *small_hf_prefix = warp_full_base + kZipservWarpsPerTile;
+    return {bitmap1, bitmap2, bitmap3, sign_mantissa, full_values, warp_hf_base, warp_full_base, small_hf_prefix};
+}
+
+__forceinline__ __device__ void zipserv_load_global_tile_to_shared(
+    const ZipservCompressedKVParams &comp,
+    const int global_tile_m,
+    const int global_tile_k,
+    __nv_bfloat16 (*smem_output)[64 + PADDING_SHARED_MEM_FOR_DECOMP],
+    uint64_t *smem_bitmap1,
+    uint64_t *smem_bitmap2,
+    uint64_t *smem_bitmap3,
+    uint8_t *smem_sign_mantissa,
+    __nv_bfloat16 *smem_full_values) {
+    const int warp_id = threadIdx.x / 32;
+    const int global_tile_idx = global_tile_m * (comp.cols / 64) + global_tile_k;
+    const int bitmap_global_offset = ((global_tile_m * 64) >> 3) * (comp.cols >> 3) + global_tile_k * 64;
+    const uint64_t *bitmap1_ptr = comp.bitmap1 + bitmap_global_offset;
+    const uint64_t *bitmap2_ptr = comp.bitmap2 + bitmap_global_offset;
+    const uint64_t *bitmap3_ptr = comp.bitmap3 + bitmap_global_offset;
+    const int *global_offset_ptr = comp.tile_offsets_global + global_tile_idx * 2;
+    const int global_hf_start = global_offset_ptr[0];
+    const int global_full_start = global_offset_ptr[1];
+    const int global_hf_count = global_offset_ptr[2] - global_hf_start;
+    const int global_full_count = global_offset_ptr[3] - global_full_start;
+
+    CopyTripleBitmapToShared<ZipservFlashConfig::TILE_BITMAP_M_V3, ZipservFlashConfig>(
+        smem_bitmap1, smem_bitmap2, smem_bitmap3, bitmap1_ptr, bitmap2_ptr, bitmap3_ptr);
+    CopyCompressedDataToShared<ZipservFlashConfig>(
+        smem_sign_mantissa,
+        smem_full_values,
+        comp.sign_mantissa + global_hf_start,
+        comp.compressed_full + global_full_start,
+        global_hf_count,
+        global_full_count);
+    cp_async_group_commit();
+    cp_async_wait_group<0>();
+    __syncthreads();
+
+    const int median_tile_idx = global_tile_idx * 4 + warp_id;
+    const int *median_offset_ptr = comp.tile_offsets_median + median_tile_idx * 2;
+    const int warp_hf_start = median_offset_ptr[0];
+    const int warp_full_start = median_offset_ptr[1];
+    uint64_t *smem_bitmap1_warp = smem_bitmap1 + warp_id * 2 * 8;
+    uint64_t *smem_bitmap2_warp = smem_bitmap2 + warp_id * 2 * 8;
+    uint64_t *smem_bitmap3_warp = smem_bitmap3 + warp_id * 2 * 8;
+
+    DecompressMedianTileToSharedMemory<ZipservFlashConfig>(
+        smem_sign_mantissa,
+        smem_full_values,
+        smem_bitmap1_warp,
+        smem_bitmap2_warp,
+        smem_bitmap3_warp,
+        warp_hf_start,
+        warp_full_start,
+        comp.start_exp,
+        smem_output,
+        warp_id);
+    __syncthreads();
+}
+
+template <typename Element, typename TensorDst>
+__forceinline__ __device__ void zipserv_zero_partition(TensorDst &dst) {
+    #pragma unroll
+    for (int i = 0; i < size<0>(dst); ++i) {
+        #pragma unroll
+        for (int j = 0; j < size<1>(dst); ++j) {
+            #pragma unroll
+            for (int k = 0; k < size<2>(dst); ++k) {
+                dst(i, j, k) = zipserv_zero_element<Element>();
+            }
+        }
+    }
+}
+
+template <typename Element, typename TensorDst, typename TensorCoord>
+__forceinline__ __device__ void zipserv_scatter_subtile(
+    TensorDst &dst,
+    const TensorCoord &coord,
+    const __nv_bfloat16 (*smem_output)[64 + PADDING_SHARED_MEM_FOR_DECOMP],
+    const int row_base,
+    const int col_base,
+    const int valid_rows,
+    const int valid_cols) {
+    #pragma unroll
+    for (int i = 0; i < size<0>(dst); ++i) {
+        #pragma unroll
+        for (int j = 0; j < size<1>(dst); ++j) {
+            #pragma unroll
+            for (int k = 0; k < size<2>(dst); ++k) {
+                const int row = get<0>(coord(i, j, k));
+                const int col = get<1>(coord(i, j, k));
+                if (row >= row_base && row < row_base + 64 && col >= col_base && col < col_base + 64) {
+                    const int local_row = row - row_base;
+                    const int local_col = col - col_base;
+                    dst(i, j, k) = (local_row < valid_rows && local_col < valid_cols)
+                        ? zipserv_convert_element<Element>(smem_output[local_row][local_col])
+                        : zipserv_zero_element<Element>();
+                }
+            }
+        }
+    }
+}
+
+__forceinline__ __device__ void zipserv_prefetch_global_tile_to_shared(
+    const ZipservCompressedKVParams &comp,
+    const int global_tile_m,
+    const int global_tile_k,
+    const ZipservScratchBufferView &scratch,
+    ZipservGlobalTileInfo &tile_info) {
+    tile_info.global_tile_idx = global_tile_m * (comp.cols / 64) + global_tile_k;
+    const int bitmap_global_offset = ((global_tile_m * 64) >> 3) * (comp.cols >> 3) + global_tile_k * 64;
+    const uint64_t *bitmap1_ptr = comp.bitmap1 + bitmap_global_offset;
+    const uint64_t *bitmap2_ptr = comp.bitmap2 + bitmap_global_offset;
+    const uint64_t *bitmap3_ptr = comp.bitmap3 + bitmap_global_offset;
+    const int *global_offset_ptr = comp.tile_offsets_global + tile_info.global_tile_idx * 2;
+    tile_info.global_hf_start = global_offset_ptr[0];
+    tile_info.global_full_start = global_offset_ptr[1];
+    const int global_hf_count = global_offset_ptr[2] - tile_info.global_hf_start;
+    const int global_full_count = global_offset_ptr[3] - tile_info.global_full_start;
+
+    CopyTripleBitmapToShared<ZipservFlashConfig::TILE_BITMAP_M_V3, ZipservFlashConfig>(
+        scratch.bitmap1, scratch.bitmap2, scratch.bitmap3, bitmap1_ptr, bitmap2_ptr, bitmap3_ptr);
+    CopyCompressedDataToShared<ZipservFlashConfig>(
+        scratch.sign_mantissa,
+        scratch.full_values,
+        comp.sign_mantissa + tile_info.global_hf_start,
+        comp.compressed_full + tile_info.global_full_start,
+        global_hf_count,
+        global_full_count);
+    cp_async_group_commit();
+}
+
+__forceinline__ __device__ void zipserv_decompress_scratch_to_output(
+    const ZipservCompressedKVParams &comp,
+    const ZipservGlobalTileInfo &tile_info,
+    const ZipservScratchBufferView &scratch,
+    __nv_bfloat16 (*smem_output)[64 + PADDING_SHARED_MEM_FOR_DECOMP]) {
+    const int warp_id = threadIdx.x / 32;
+    const int *median_offset_ptr = comp.tile_offsets_median + (tile_info.global_tile_idx * kZipservWarpsPerTile + warp_id) * 2;
+    const int warp_hf_start = median_offset_ptr[0];
+    const int warp_full_start = median_offset_ptr[1];
+    uint64_t *smem_bitmap1_warp = scratch.bitmap1 + warp_id * 2 * 8;
+    uint64_t *smem_bitmap2_warp = scratch.bitmap2 + warp_id * 2 * 8;
+    uint64_t *smem_bitmap3_warp = scratch.bitmap3 + warp_id * 2 * 8;
+
+    DecompressMedianTileToSharedMemory<ZipservFlashConfig>(
+        scratch.sign_mantissa,
+        scratch.full_values,
+        smem_bitmap1_warp,
+        smem_bitmap2_warp,
+        smem_bitmap3_warp,
+        warp_hf_start,
+        warp_full_start,
+        comp.start_exp,
+        smem_output,
+        warp_id);
+    __syncthreads();
+}
+
+template <typename Element, typename TensorDst, typename TensorCoord>
+__forceinline__ __device__ void zipserv_load_block_to_smem(
+    const ZipservCompressedKVParams &comp,
+    const int batch_idx,
+    const int kv_head,
+    const int block_row,
+    const int total_valid_rows,
+    const int block_rows,
+    TensorDst &dst,
+    const TensorCoord &coord,
+    char *zipserv_smem) {
+    zipserv_zero_partition<Element>(dst);
+
+    constexpr int kRowsPerTile = 64;
+    constexpr int kColsPerTile = 64;
+    const int total_rows_per_head = comp.head_stride_rows;
+    const int head_row_base = batch_idx * comp.batch_stride_rows + kv_head * total_rows_per_head + block_row;
+    const int remaining_head_rows = max(0, total_rows_per_head - block_row);
+    const int rows_to_load = max(0, min(block_rows, min(total_valid_rows, remaining_head_rows)));
+    const int max_row_tiles = cute::ceil_div(rows_to_load, kRowsPerTile);
+    const int max_col_tiles = cute::ceil_div(comp.cols, kColsPerTile);
+    const int total_tiles = max_row_tiles * max_col_tiles;
+    if (total_tiles == 0) {
+        __syncthreads();
+        return;
+    }
+
+    auto smem_output = zipserv_get_output_buffer(zipserv_smem);
+    ZipservGlobalTileInfo current_tile_info;
+    ZipservGlobalTileInfo next_tile_info;
+    auto current_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, 0);
+    zipserv_prefetch_global_tile_to_shared(
+        comp,
+        head_row_base / kRowsPerTile,
+        0,
+        current_scratch,
+        current_tile_info);
+    cp_async_wait_group<0>();
+    __syncthreads();
+
+    for (int tile_idx = 0; tile_idx < total_tiles; ++tile_idx) {
+        const int row_tile = tile_idx / max_col_tiles;
+        const int col_tile = tile_idx % max_col_tiles;
+        const int tile_row_base = row_tile * kRowsPerTile;
+        const bool has_next = tile_idx + 1 < total_tiles;
+        auto next_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, (tile_idx + 1) & 1);
+
+        if (has_next) {
+            const int next_row_tile = (tile_idx + 1) / max_col_tiles;
+            const int next_col_tile = (tile_idx + 1) % max_col_tiles;
+            zipserv_prefetch_global_tile_to_shared(
+                comp,
+                (head_row_base + next_row_tile * kRowsPerTile) / kRowsPerTile,
+                next_col_tile,
+                next_scratch,
+                next_tile_info);
+        }
+
+        zipserv_decompress_scratch_to_output(comp, current_tile_info, current_scratch, smem_output);
+        zipserv_scatter_subtile<Element>(
+            dst,
+            coord,
+            smem_output,
+            tile_row_base,
+            col_tile * kColsPerTile,
+            zipserv_valid_rows(rows_to_load, tile_row_base, kRowsPerTile),
+            min(kColsPerTile, comp.cols - col_tile * kColsPerTile));
+        __syncthreads();
+
+        if (has_next) {
+            cp_async_wait_group<0>();
+            __syncthreads();
+            current_scratch = next_scratch;
+            current_tile_info = next_tile_info;
+        }
+    }
+    __syncthreads();
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -165,6 +487,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+    char *zipserv_smem = reinterpret_cast<char *>(
+        (reinterpret_cast<uintptr_t>(smem_ + Kernel_traits::kSmemSize + 127) & ~uintptr_t(127)));
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -264,11 +588,25 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
     }
 
+    const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
     int n_block = n_block_max - 1;
-    // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
+    if (params.has_zipserv_kv) {
+        zipserv_load_block_to_smem<Element>(
+            params.zipserv_k,
+            bidb_cache,
+            bidh / params.h_h_k_ratio,
+            n_block * kBlockN,
+            binfo.actual_seqlen_k - n_block * kBlockN,
+            kBlockN,
+            tKsK,
+            tKVcKV,
+            zipserv_smem);
+    } else {
+        // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+        cute::cp_async_fence();
+    }
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
 
@@ -306,7 +644,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
 
         // Advance gV
-        if (masking_step > 0) {
+        if (params.has_zipserv_kv) {
+            zipserv_load_block_to_smem<Element>(
+                params.zipserv_v,
+                bidb_cache,
+                bidh / params.h_h_k_ratio,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k - n_block * kBlockN,
+                kBlockN,
+                tVsV,
+                tKVcKV,
+                zipserv_smem);
+        } else if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         } else {
             // Clear the smem tiles to account for predicated off loads
@@ -314,7 +663,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
-        cute::cp_async_fence();
+        if (!params.has_zipserv_kv) { cute::cp_async_fence(); }
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -332,10 +681,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            if (params.has_zipserv_kv) {
+                zipserv_load_block_to_smem<Element>(
+                    params.zipserv_k,
+                    bidb_cache,
+                    bidh / params.h_h_k_ratio,
+                    (n_block - 1) * kBlockN,
+                    binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
+                    kBlockN,
+                    tKsK,
+                    tKVcKV,
+                    zipserv_smem);
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -380,8 +742,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
-        cute::cp_async_fence();
+        if (params.has_zipserv_kv) {
+            zipserv_load_block_to_smem<Element>(
+                params.zipserv_v,
+                bidb_cache,
+                bidh / params.h_h_k_ratio,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k - n_block * kBlockN,
+                kBlockN,
+                tVsV,
+                tKVcKV,
+                zipserv_smem);
+        } else {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+        }
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -394,10 +769,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            if (params.has_zipserv_kv) {
+                zipserv_load_block_to_smem<Element>(
+                    params.zipserv_k,
+                    bidb_cache,
+                    bidh / params.h_h_k_ratio,
+                    (n_block - 1) * kBlockN,
+                    binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
+                    kBlockN,
+                    tKsK,
+                    tKVcKV,
+                    zipserv_smem);
+            } else {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
@@ -612,6 +1000,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+    char *zipserv_smem = reinterpret_cast<char *>(
+        (reinterpret_cast<uintptr_t>(smem_ + Kernel_traits::kSmemSize + 127) & ~uintptr_t(127)));
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -821,10 +1211,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     int n_block = n_block_max - 1;
-    // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
+    if (params.has_zipserv_kv) {
+        zipserv_load_block_to_smem<Element>(
+            params.zipserv_k,
+            bidb_cache,
+            bidh / params.h_h_k_ratio,
+            n_block * kBlockN,
+            binfo.actual_seqlen_k - n_block * kBlockN,
+            kBlockN,
+            tKsK,
+            tKVcKV,
+            zipserv_smem);
+    } else {
+        // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
+        cute::cp_async_fence();
+    }
 
     // FLASH_NAMESPACE::cp_async_wait<0>();
     // __syncthreads();
@@ -857,7 +1260,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
 
         // Advance gV
-        if (masking_step > 0) {
+        if (params.has_zipserv_kv) {
+            zipserv_load_block_to_smem<Element>(
+                params.zipserv_v,
+                bidb_cache,
+                bidh / params.h_h_k_ratio,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k - n_block * kBlockN,
+                kBlockN,
+                tVsV,
+                tKVcKV,
+                zipserv_smem);
+        } else if (masking_step > 0) {
             if (block_table == nullptr) {
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
@@ -874,7 +1288,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
-        cute::cp_async_fence();
+        if (!params.has_zipserv_kv) { cute::cp_async_fence(); }
 
         FLASH_NAMESPACE::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -896,20 +1310,33 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // __syncthreads();
 
         if (n_block > n_block_min) {
-            // Advance gK
-            if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (params.has_zipserv_kv) {
+                zipserv_load_block_to_smem<Element>(
+                    params.zipserv_k,
+                    bidb_cache,
+                    bidh / params.h_h_k_ratio,
+                    (n_block - 1) * kBlockN,
+                    binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
+                    kBlockN,
+                    tKsK,
+                    tKVcKV,
+                    zipserv_smem);
             } else {
-                const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
-                const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
-                const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
-                const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                // Advance gK
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                    const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                    const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                    const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                    tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
         }
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -940,17 +1367,30 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         // Advance gV
-        if (block_table == nullptr) {
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        if (params.has_zipserv_kv) {
+            zipserv_load_block_to_smem<Element>(
+                params.zipserv_v,
+                bidb_cache,
+                bidh / params.h_h_k_ratio,
+                n_block * kBlockN,
+                binfo.actual_seqlen_k - n_block * kBlockN,
+                kBlockN,
+                tVsV,
+                tKVcKV,
+                zipserv_smem);
         } else {
-            const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
-            const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
-            const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
-            const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
-            tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+            if (block_table == nullptr) {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            } else {
+                const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
+                const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
+                const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
+                const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
+                tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+            }
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
         }
-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
-        cute::cp_async_fence();
 
         FLASH_NAMESPACE::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -963,20 +1403,33 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
-            // Advance gK
-            if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+            if (params.has_zipserv_kv) {
+                zipserv_load_block_to_smem<Element>(
+                    params.zipserv_k,
+                    bidb_cache,
+                    bidh / params.h_h_k_ratio,
+                    (n_block - 1) * kBlockN,
+                    binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
+                    kBlockN,
+                    tKsK,
+                    tKVcKV,
+                    zipserv_smem);
             } else {
-                const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
-                const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
-                const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
-                const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                // Advance gK
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                    const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                    const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                    const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                    tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(

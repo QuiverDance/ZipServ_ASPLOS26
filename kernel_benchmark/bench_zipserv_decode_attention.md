@@ -2,7 +2,7 @@
 
 `bench_zipserv_decode_attention.py` now runs a batch-size sweep only.
 
-- `kv_len` is fixed to `1020`
+- `kv_len` is configurable via `--kv_len` and defaults to `1020`
 - supported modes are only `flashattn`, `flashinfer`, `staged_flashattn`, `staged_flashinfer`, `fused_flashattn`
 - output rows vary by `batch_size`
 
@@ -33,7 +33,7 @@ TORCH_CUDA_ARCH_LIST=8.6 python build_zipserv_decode_attention_extensions.py --t
 
 ## Run
 
-All five modes together:
+All supported modes together:
 
 ```bash
 source ~/ls/etc/profile.d/conda.sh
@@ -41,6 +41,7 @@ conda activate zipserv
 cd ~/ZipServ_ASPLOS26/kernel_benchmark
 python bench_zipserv_decode_attention.py \
   --layer 0 \
+  --kv_len 1020 \
   --modes flashattn,flashinfer,staged_flashattn,staged_flashinfer,fused_flashattn \
   --batch_sizes 1,2,4,8,16,32,64,128,256,512 \
   --warmup 10 \
@@ -56,11 +57,45 @@ conda activate zipserv
 cd ~/ZipServ_ASPLOS26/kernel_benchmark
 python bench_zipserv_decode_attention.py \
   --layer 0 \
+  --kv_len 1020 \
   --modes fused_flashattn \
   --batch_sizes 1,2,4,8,16,32,64,128,256,512 \
   --warmup 10 \
   --iters 100 \
-  --out_csv zipserv_decode_attention_fused_flashattn.csv
+  --out_csv zipserv_decode_attention_fused_paths.csv
+```
+
+`fused_flashattn` with regular path forced:
+
+```bash
+source ~/ls/etc/profile.d/conda.sh
+conda activate zipserv
+cd ~/ZipServ_ASPLOS26/kernel_benchmark
+python bench_zipserv_decode_attention.py \
+  --layer 0 \
+  --kv_len 1020 \
+  --modes fused_flashattn \
+  --batch_sizes 1,2,4,8,16,32,64,128,256,511 \
+  --warmup 10 \
+  --iters 100 \
+  --fused_force_regular \
+  --out_csv zipserv_decode_attention_fused_force_regular.csv
+```
+
+`staged_flashattn` safe sweep:
+
+```bash
+source ~/ls/etc/profile.d/conda.sh
+conda activate zipserv
+cd ~/ZipServ_ASPLOS26/kernel_benchmark
+python bench_zipserv_decode_attention.py \
+  --layer 0 \
+  --kv_len 1020 \
+  --modes staged_flashattn \
+  --batch_sizes 1,2,4,8,16,32,64,128,256,511 \
+  --warmup 10 \
+  --iters 100 \
+  --out_csv zipserv_decode_attention_staged_flashattn_b1to511.csv
 ```
 
 ## Modes
@@ -81,4 +116,6 @@ python bench_zipserv_decode_attention.py \
 - `flashattn`, `flashinfer`는 각자 direct baseline이므로 `base_path = 1`이다
 - `flashinfer` paths use page size `16`
 - `fused_flashattn` currently requires `num_kv_heads == 8`
+- `--fused_force_regular`는 `fused_flashattn` 호출에서 `num_splits=1`을 넘겨 heuristic split routing 대신 regular non-split FlashAttention path를 강제로 사용한다. 플래그를 빼면 원래 heuristic 기반 라우팅으로 돌아간다.
+- `staged_flashattn`는 `batch_size=512`에서 현재 실패한다. 직접 원인은 총 VRAM 부족이라기보다, decompressor `BF16TripleBitmap_Decompress_API()`의 `GridDim.y = rows / 64`가 `65536`이 되어 `cc 8.6` 장치의 최대 grid `y` 차원 `65535`를 넘기기 때문이다. 같은 설정에서 `batch_size=511`은 `GridDim.y = 65408`으로 정상 동작한다.
 - dense torch reference는 사용하지 않는다. 정확도는 reference 제거 전에 batch `1..256`에서 사전 확인했다.
