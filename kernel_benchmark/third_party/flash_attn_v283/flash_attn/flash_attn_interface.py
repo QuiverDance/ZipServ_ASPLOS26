@@ -1655,14 +1655,14 @@ def flash_attn_with_kvcache(
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
            to automatically determine the number of splits.
-           Don't change this unless you know what you are doing.
+           The ZipServ benchmark now defaults to num_splits=1 so the regular decode kernel is used.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
         zipserv_k [optional]: ZipServ-compressed K metadata. Accepts a dict/object/sequence with
             fields `sign_mantissa`, `compressed_full`, `bitmap1`, `bitmap2`, `bitmap3`,
             `tile_offsets_median`, `tile_offsets_global`, `rows`, `cols`,
             `max_high_freq_count`, `max_full_count`, `start_exp`. When provided together with
             `zipserv_v` and `zipserv_num_heads_k`, the compressed decode path is handled inside
-            `flash_attn_2_cuda`'s split-kv kernel without materializing a dense KV cache.
+            `flash_attn_2_cuda` without materializing a dense KV cache.
         zipserv_v [optional]: ZipServ-compressed V metadata with the same schema as `zipserv_k`.
         zipserv_num_heads_k [optional]: Number of KV heads represented by the ZipServ metadata.
             Required when `zipserv_k` / `zipserv_v` are used without dense cache placeholders.

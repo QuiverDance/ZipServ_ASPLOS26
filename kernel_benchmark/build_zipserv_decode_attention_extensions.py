@@ -127,16 +127,18 @@ def ensure_extension_built(target: str, verbose: bool = False) -> Path | None:
     if target == "zipserv":
         return build_zipserv_extension(verbose=verbose)
     if target == "zipserv_flashattn":
-        return build_flash_attn_2_cuda_extension(verbose=verbose)
+        return build_flash_attn_2_cuda_extension(verbose=verbose, regular_only=True)
     if target == "zipserv_flashattn_regular_only":
         return build_flash_attn_2_cuda_extension(verbose=verbose, regular_only=True)
+    if target == "zipserv_flashattn_splitkv":
+        return build_flash_attn_2_cuda_extension(verbose=verbose)
     if target == "zipserv_flashattn_ck":
         return build_zipserv_flash_fused_extension(verbose=verbose)
     if target == "all":
         build_zipserv_extension(verbose=verbose)
-        build_flash_attn_2_cuda_extension(verbose=verbose)
+        build_flash_attn_2_cuda_extension(verbose=verbose, regular_only=True)
         build_zipserv_flash_fused_extension(verbose=verbose)
-        return newest_shared_object(FLASH_ATTN_EXT_BUILD_DIR, FLASH_ATTN_EXT_NAME)
+        return newest_shared_object(FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR, FLASH_ATTN_EXT_NAME)
     raise ValueError(f"Unknown target: {target}")
 
 
@@ -144,7 +146,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Prebuild decode-attention benchmark extensions without running the benchmark")
     parser.add_argument(
         "--target",
-        choices=["zipserv", "zipserv_flashattn", "zipserv_flashattn_regular_only", "zipserv_flashattn_ck", "all"],
+        choices=[
+            "zipserv",
+            "zipserv_flashattn",
+            "zipserv_flashattn_regular_only",
+            "zipserv_flashattn_splitkv",
+            "zipserv_flashattn_ck",
+            "all",
+        ],
         default="all",
     )
     parser.add_argument("--verbose", action="store_true")
@@ -158,12 +167,12 @@ def main() -> None:
     if args.target in {"zipserv", "all"}:
         so_path = build_zipserv_extension(verbose=args.verbose)
         print(f"{EXT_NAME}: {so_path if so_path is not None else 'built, .so path not found'}")
-    if args.target in {"zipserv_flashattn", "all"}:
-        so_path = build_flash_attn_2_cuda_extension(verbose=args.verbose)
-        print(f"{FLASH_ATTN_EXT_NAME}: {so_path if so_path is not None else 'built, .so path not found'}")
-    if args.target == "zipserv_flashattn_regular_only":
+    if args.target in {"zipserv_flashattn", "zipserv_flashattn_regular_only", "all"}:
         so_path = build_flash_attn_2_cuda_extension(verbose=args.verbose, regular_only=True)
         print(f"{FLASH_ATTN_EXT_NAME} (regular-only): {so_path if so_path is not None else 'built, .so path not found'}")
+    if args.target == "zipserv_flashattn_splitkv":
+        so_path = build_flash_attn_2_cuda_extension(verbose=args.verbose)
+        print(f"{FLASH_ATTN_EXT_NAME} (split-kv): {so_path if so_path is not None else 'built, .so path not found'}")
     if args.target in {"zipserv_flashattn_ck", "all"}:
         so_path = build_zipserv_flash_fused_extension(verbose=args.verbose)
         print(f"{ZIPSERV_FLASH_FUSED_EXT_NAME}: {so_path if so_path is not None else 'built, .so path not found'}")

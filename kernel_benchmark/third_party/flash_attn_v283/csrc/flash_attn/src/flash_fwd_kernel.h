@@ -73,6 +73,15 @@ struct ZipservGlobalTileInfo {
     int global_full_start;
 };
 
+struct ZipservBlockLoadState {
+    int total_tiles;
+    int max_col_tiles;
+    int rows_to_load;
+    int global_tile_m_base;
+    bool valid;
+    ZipservGlobalTileInfo first_tile_info;
+};
+
 __forceinline__ __device__ size_t zipserv_output_buffer_bytes() {
     return static_cast<size_t>(64 * (64 + PADDING_SHARED_MEM_FOR_DECOMP) * sizeof(__nv_bfloat16));
 }
@@ -268,19 +277,15 @@ __forceinline__ __device__ void zipserv_decompress_scratch_to_output(
     __syncthreads();
 }
 
-template <typename Element, typename TensorDst, typename TensorCoord>
-__forceinline__ __device__ void zipserv_load_block_to_smem(
+__forceinline__ __device__ ZipservBlockLoadState zipserv_begin_block_load(
     const ZipservCompressedKVParams &comp,
     const int batch_idx,
     const int kv_head,
     const int block_row,
     const int total_valid_rows,
     const int block_rows,
-    TensorDst &dst,
-    const TensorCoord &coord,
     char *zipserv_smem) {
-    zipserv_zero_partition<Element>(dst);
-
+    ZipservBlockLoadState load_state{};
     constexpr int kRowsPerTile = 64;
     constexpr int kColsPerTile = 64;
     const int total_rows_per_head = comp.head_stride_rows;
@@ -290,37 +295,58 @@ __forceinline__ __device__ void zipserv_load_block_to_smem(
     const int max_row_tiles = cute::ceil_div(rows_to_load, kRowsPerTile);
     const int max_col_tiles = cute::ceil_div(comp.cols, kColsPerTile);
     const int total_tiles = max_row_tiles * max_col_tiles;
+    load_state.total_tiles = total_tiles;
+    load_state.max_col_tiles = max_col_tiles;
+    load_state.rows_to_load = rows_to_load;
+    load_state.global_tile_m_base = head_row_base / kRowsPerTile;
+    load_state.valid = total_tiles > 0;
     if (total_tiles == 0) {
+        return load_state;
+    }
+
+    auto current_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, 0);
+    zipserv_prefetch_global_tile_to_shared(
+        comp,
+        load_state.global_tile_m_base,
+        0,
+        current_scratch,
+        load_state.first_tile_info);
+    return load_state;
+}
+
+template <typename Element, typename TensorDst, typename TensorCoord>
+__forceinline__ __device__ void zipserv_finish_block_load(
+    const ZipservCompressedKVParams &comp,
+    const ZipservBlockLoadState &load_state,
+    TensorDst &dst,
+    const TensorCoord &coord,
+    char *zipserv_smem) {
+    zipserv_zero_partition<Element>(dst);
+    if (!load_state.valid) {
         __syncthreads();
         return;
     }
 
+    constexpr int kRowsPerTile = 64;
+    constexpr int kColsPerTile = 64;
     auto smem_output = zipserv_get_output_buffer(zipserv_smem);
-    ZipservGlobalTileInfo current_tile_info;
+    ZipservGlobalTileInfo current_tile_info = load_state.first_tile_info;
     ZipservGlobalTileInfo next_tile_info;
     auto current_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, 0);
-    zipserv_prefetch_global_tile_to_shared(
-        comp,
-        head_row_base / kRowsPerTile,
-        0,
-        current_scratch,
-        current_tile_info);
-    cp_async_wait_group<0>();
-    __syncthreads();
 
-    for (int tile_idx = 0; tile_idx < total_tiles; ++tile_idx) {
-        const int row_tile = tile_idx / max_col_tiles;
-        const int col_tile = tile_idx % max_col_tiles;
+    for (int tile_idx = 0; tile_idx < load_state.total_tiles; ++tile_idx) {
+        const int row_tile = tile_idx / load_state.max_col_tiles;
+        const int col_tile = tile_idx % load_state.max_col_tiles;
         const int tile_row_base = row_tile * kRowsPerTile;
-        const bool has_next = tile_idx + 1 < total_tiles;
+        const bool has_next = tile_idx + 1 < load_state.total_tiles;
         auto next_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, (tile_idx + 1) & 1);
 
         if (has_next) {
-            const int next_row_tile = (tile_idx + 1) / max_col_tiles;
-            const int next_col_tile = (tile_idx + 1) % max_col_tiles;
+            const int next_row_tile = (tile_idx + 1) / load_state.max_col_tiles;
+            const int next_col_tile = (tile_idx + 1) % load_state.max_col_tiles;
             zipserv_prefetch_global_tile_to_shared(
                 comp,
-                (head_row_base + next_row_tile * kRowsPerTile) / kRowsPerTile,
+                load_state.global_tile_m_base + next_row_tile,
                 next_col_tile,
                 next_scratch,
                 next_tile_info);
@@ -333,18 +359,42 @@ __forceinline__ __device__ void zipserv_load_block_to_smem(
             smem_output,
             tile_row_base,
             col_tile * kColsPerTile,
-            zipserv_valid_rows(rows_to_load, tile_row_base, kRowsPerTile),
+            zipserv_valid_rows(load_state.rows_to_load, tile_row_base, kRowsPerTile),
             min(kColsPerTile, comp.cols - col_tile * kColsPerTile));
         __syncthreads();
 
         if (has_next) {
-            cp_async_wait_group<0>();
+            FLASH_NAMESPACE::cp_async_wait<0>();
             __syncthreads();
             current_scratch = next_scratch;
             current_tile_info = next_tile_info;
         }
     }
     __syncthreads();
+}
+
+template <typename Element, typename TensorDst, typename TensorCoord>
+__forceinline__ __device__ void zipserv_load_block_to_smem(
+    const ZipservCompressedKVParams &comp,
+    const int batch_idx,
+    const int kv_head,
+    const int block_row,
+    const int total_valid_rows,
+    const int block_rows,
+    TensorDst &dst,
+    const TensorCoord &coord,
+    char *zipserv_smem) {
+    const auto load_state = zipserv_begin_block_load(
+        comp,
+        batch_idx,
+        kv_head,
+        block_row,
+        total_valid_rows,
+        block_rows,
+        zipserv_smem);
+    FLASH_NAMESPACE::cp_async_wait<0>();
+    __syncthreads();
+    zipserv_finish_block_load<Element>(comp, load_state, dst, coord, zipserv_smem);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -589,17 +639,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
+    ZipservBlockLoadState zipserv_k_load_state{};
+    ZipservBlockLoadState zipserv_v_load_state{};
     int n_block = n_block_max - 1;
     if (params.has_zipserv_kv) {
-        zipserv_load_block_to_smem<Element>(
+        zipserv_k_load_state = zipserv_begin_block_load(
             params.zipserv_k,
             bidb_cache,
             bidh / params.h_h_k_ratio,
             n_block * kBlockN,
             binfo.actual_seqlen_k - n_block * kBlockN,
             kBlockN,
-            tKsK,
-            tKVcKV,
             zipserv_smem);
     } else {
         // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
@@ -642,18 +692,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+        }
 
         // Advance gV
         if (params.has_zipserv_kv) {
-            zipserv_load_block_to_smem<Element>(
+            zipserv_v_load_state = zipserv_begin_block_load(
                 params.zipserv_v,
                 bidb_cache,
                 bidh / params.h_h_k_ratio,
                 n_block * kBlockN,
                 binfo.actual_seqlen_k - n_block * kBlockN,
                 kBlockN,
-                tVsV,
-                tKVcKV,
                 zipserv_smem);
         } else if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
@@ -680,17 +731,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+        }
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {
-                zipserv_load_block_to_smem<Element>(
+                zipserv_k_load_state = zipserv_begin_block_load(
                     params.zipserv_k,
                     bidb_cache,
                     bidh / params.h_h_k_ratio,
                     (n_block - 1) * kBlockN,
                     binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
                     kBlockN,
-                    tKsK,
-                    tKVcKV,
                     zipserv_smem);
             } else {
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
@@ -743,15 +795,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_load_block_to_smem<Element>(
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+        }
+        if (params.has_zipserv_kv) {
+            zipserv_v_load_state = zipserv_begin_block_load(
                 params.zipserv_v,
                 bidb_cache,
                 bidh / params.h_h_k_ratio,
                 n_block * kBlockN,
                 binfo.actual_seqlen_k - n_block * kBlockN,
                 kBlockN,
-                tVsV,
-                tKVcKV,
                 zipserv_smem);
         } else {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
@@ -768,17 +821,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+        }
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {
-                zipserv_load_block_to_smem<Element>(
+                zipserv_k_load_state = zipserv_begin_block_load(
                     params.zipserv_k,
                     bidb_cache,
                     bidh / params.h_h_k_ratio,
                     (n_block - 1) * kBlockN,
                     binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
                     kBlockN,
-                    tKsK,
-                    tKVcKV,
                     zipserv_smem);
             } else {
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
@@ -1210,17 +1264,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
     }
 
+    ZipservBlockLoadState zipserv_k_load_state{};
+    ZipservBlockLoadState zipserv_v_load_state{};
     int n_block = n_block_max - 1;
     if (params.has_zipserv_kv) {
-        zipserv_load_block_to_smem<Element>(
+        zipserv_k_load_state = zipserv_begin_block_load(
             params.zipserv_k,
             bidb_cache,
             bidh / params.h_h_k_ratio,
             n_block * kBlockN,
             binfo.actual_seqlen_k - n_block * kBlockN,
             kBlockN,
-            tKsK,
-            tKVcKV,
             zipserv_smem);
     } else {
         // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
@@ -1258,18 +1312,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+        }
 
         // Advance gV
         if (params.has_zipserv_kv) {
-            zipserv_load_block_to_smem<Element>(
+            zipserv_v_load_state = zipserv_begin_block_load(
                 params.zipserv_v,
                 bidb_cache,
                 bidh / params.h_h_k_ratio,
                 n_block * kBlockN,
                 binfo.actual_seqlen_k - n_block * kBlockN,
                 kBlockN,
-                tVsV,
-                tKVcKV,
                 zipserv_smem);
         } else if (masking_step > 0) {
             if (block_table == nullptr) {
@@ -1306,20 +1361,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+        }
         // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tVsV); }
         // __syncthreads();
 
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {
-                zipserv_load_block_to_smem<Element>(
+                zipserv_k_load_state = zipserv_begin_block_load(
                     params.zipserv_k,
                     bidb_cache,
                     bidh / params.h_h_k_ratio,
                     (n_block - 1) * kBlockN,
                     binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
                     kBlockN,
-                    tKsK,
-                    tKVcKV,
                     zipserv_smem);
             } else {
                 // Advance gK
@@ -1366,17 +1422,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+        }
         // Advance gV
         if (params.has_zipserv_kv) {
-            zipserv_load_block_to_smem<Element>(
+            zipserv_v_load_state = zipserv_begin_block_load(
                 params.zipserv_v,
                 bidb_cache,
                 bidh / params.h_h_k_ratio,
                 n_block * kBlockN,
                 binfo.actual_seqlen_k - n_block * kBlockN,
                 kBlockN,
-                tVsV,
-                tKVcKV,
                 zipserv_smem);
         } else {
             if (block_table == nullptr) {
@@ -1402,17 +1459,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        if (params.has_zipserv_kv) {
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+        }
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {
-                zipserv_load_block_to_smem<Element>(
+                zipserv_k_load_state = zipserv_begin_block_load(
                     params.zipserv_k,
                     bidb_cache,
                     bidh / params.h_h_k_ratio,
                     (n_block - 1) * kBlockN,
                     binfo.actual_seqlen_k - (n_block - 1) * kBlockN,
                     kBlockN,
-                    tKsK,
-                    tKVcKV,
                     zipserv_smem);
             } else {
                 // Advance gK

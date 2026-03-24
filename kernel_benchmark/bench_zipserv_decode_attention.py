@@ -212,14 +212,14 @@ def load_zipserv_extension() -> object:
     return load_prebuilt_extension(EXT_NAME, ZIPSERV_EXT_BUILD_DIR, build_hint, "zipserv")
 
 
-def load_integrated_flash_attn_extension(regular_only: bool = False) -> object:
+def load_integrated_flash_attn_extension(regular_only: bool = True) -> object:
     build_hint = "python build_zipserv_decode_attention_extensions.py --target zipserv_flashattn"
-    build_dir = FLASH_ATTN_EXT_BUILD_DIR
+    build_dir = FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR
     build_target = "zipserv_flashattn"
-    if regular_only:
-        build_hint = "python build_zipserv_decode_attention_extensions.py --target zipserv_flashattn_regular_only"
-        build_dir = FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR
-        build_target = "zipserv_flashattn_regular_only"
+    if not regular_only:
+        build_hint = "python build_zipserv_decode_attention_extensions.py --target zipserv_flashattn_splitkv"
+        build_dir = FLASH_ATTN_EXT_BUILD_DIR
+        build_target = "zipserv_flashattn_splitkv"
     return load_prebuilt_extension(
         FLASH_ATTN_EXT_NAME,
         build_dir,
@@ -510,7 +510,7 @@ def availability_or_raise(modes: Iterable[str]) -> None:
 def load_flash_attn_with_kvcache(
     use_integrated_zipserv: bool = False,
     prefer_loaded_extension: bool = True,
-    integrated_regular_only: bool = False,
+    integrated_regular_only: bool = True,
 ) -> Callable[..., torch.Tensor]:
     vendored_root = SCRIPT_DIR / "third_party" / "flash_attn_v283"
 
@@ -640,7 +640,7 @@ def make_flash_attn_stage_runner(
     q: torch.Tensor,
     kv_len: int,
     use_integrated_extension: bool = False,
-    force_regular: bool = False,
+    force_regular: bool = True,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     flash_attn_with_kvcache = load_flash_attn_with_kvcache(
         use_integrated_zipserv=use_integrated_extension,
@@ -670,7 +670,7 @@ def make_flash_attn_zipserv_runner(
     kv_heads: int,
     comp_k: ZipservCompressed,
     comp_v: ZipservCompressed,
-    force_regular: bool = False,
+    force_regular: bool = True,
 ) -> Callable[[], torch.Tensor]:
     flash_attn_with_kvcache = load_flash_attn_with_kvcache(
         use_integrated_zipserv=True,
@@ -843,7 +843,12 @@ def main() -> None:
     parser.add_argument(
         "--fused_force_regular",
         action="store_true",
-        help="For fused_flashattn, force FlashAttention's regular non-split path by passing num_splits=1",
+        help="Deprecated: fused_flashattn now defaults to FlashAttention's regular non-split path",
+    )
+    parser.add_argument(
+        "--fused_splitkv",
+        action="store_true",
+        help="Opt back into the legacy split-kv fused FlashAttention path for comparison",
     )
     args = parser.parse_args()
 
@@ -890,6 +895,9 @@ def main() -> None:
     rows = []
     header_state = {"printed": False}
     use_integrated_flashattn_family = bool({FUSED_FLASH_ATTN_MODE} & set(modes))
+    # Default fused experiments to the regular decode kernel. The split-kv ZipServ path remains
+    # opt-in for comparison, but it is no longer the benchmark default or the default build.
+    use_fused_regular = not args.fused_splitkv or args.fused_force_regular
     for batch_size in batch_sizes:
         batch_kv_pairs = select_kv_pairs(kv_pairs, batch_size, start_pair_idx=kv_pair_offset)
         dense_k, dense_v = build_batched_dense_kv(batch_kv_pairs, args.kv_len, device)
@@ -931,7 +939,7 @@ def main() -> None:
                 q,
                 args.kv_len,
                 use_integrated_extension=use_integrated_flashattn_family,
-                force_regular=args.fused_force_regular and use_integrated_flashattn_family,
+                force_regular=use_integrated_flashattn_family and use_fused_regular,
             )
             _, metrics = benchmark_one(
                 ext,
@@ -1006,7 +1014,7 @@ def main() -> None:
                     num_kv_heads,
                     fused_comp_k,
                     fused_comp_v,
-                    force_regular=args.fused_force_regular,
+                    force_regular=use_fused_regular,
                 )
                 _, fused_metrics = benchmark_one(
                     ext,
