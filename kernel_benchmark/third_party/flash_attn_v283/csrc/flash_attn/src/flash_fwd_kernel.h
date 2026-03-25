@@ -213,7 +213,7 @@ __forceinline__ __device__ void zipserv_prefetch_global_tile_to_shared(
     cp_async_group_commit();
 }
 
-template <typename Element, typename TensorDst>
+template <typename Element, bool FullTile, typename TensorDst>
 __forceinline__ __device__ void zipserv_decompress_scratch_to_dst(
     const ZipservCompressedKVParams &comp,
     const ZipservGlobalTileInfo &tile_info,
@@ -290,14 +290,21 @@ __forceinline__ __device__ void zipserv_decompress_scratch_to_dst(
 
             const int tile_row = warp_id * 16 + row_group * 8 + local_m;
             const int tile_col = col_group * 8 + local_k;
-            if (tile_row < valid_rows) {
+            if constexpr (FullTile) {
                 const int dst_row = row_base + tile_row;
                 const int dst_col = col_base + tile_col;
-                if (tile_col < valid_cols) {
-                    dst(dst_row, dst_col) = zipserv_convert_element<Element>(val1);
-                }
-                if (tile_col + 1 < valid_cols) {
-                    dst(dst_row, dst_col + 1) = zipserv_convert_element<Element>(val2);
+                dst(dst_row, dst_col) = zipserv_convert_element<Element>(val1);
+                dst(dst_row, dst_col + 1) = zipserv_convert_element<Element>(val2);
+            } else {
+                if (tile_row < valid_rows) {
+                    const int dst_row = row_base + tile_row;
+                    const int dst_col = col_base + tile_col;
+                    if (tile_col < valid_cols) {
+                        dst(dst_row, dst_col) = zipserv_convert_element<Element>(val1);
+                    }
+                    if (tile_col + 1 < valid_cols) {
+                        dst(dst_row, dst_col + 1) = zipserv_convert_element<Element>(val2);
+                    }
                 }
             }
 
@@ -309,7 +316,6 @@ __forceinline__ __device__ void zipserv_decompress_scratch_to_dst(
             warp_full_start += 64 - num_high_freq_lane_31;
         }
     }
-    __syncthreads();
 }
 
 __forceinline__ __device__ ZipservBlockLoadState zipserv_begin_block_load(
@@ -390,15 +396,29 @@ __forceinline__ __device__ void zipserv_finish_block_load(
                 next_tile_info);
         }
 
-        zipserv_decompress_scratch_to_dst<Element>(
-            comp,
-            current_tile_info,
-            current_scratch,
-            dst_smem,
-            tile_row_base,
-            col_tile * kColsPerTile,
-            zipserv_valid_rows(load_state.rows_to_load, tile_row_base, kRowsPerTile),
-            min(kColsPerTile, comp.cols - col_tile * kColsPerTile));
+        const int valid_rows = zipserv_valid_rows(load_state.rows_to_load, tile_row_base, kRowsPerTile);
+        const int valid_cols = min(kColsPerTile, comp.cols - col_tile * kColsPerTile);
+        if (valid_rows == kRowsPerTile && valid_cols == kColsPerTile) {
+            zipserv_decompress_scratch_to_dst<Element, /*FullTile=*/true>(
+                comp,
+                current_tile_info,
+                current_scratch,
+                dst_smem,
+                tile_row_base,
+                col_tile * kColsPerTile,
+                valid_rows,
+                valid_cols);
+        } else {
+            zipserv_decompress_scratch_to_dst<Element, /*FullTile=*/false>(
+                comp,
+                current_tile_info,
+                current_scratch,
+                dst_smem,
+                tile_row_base,
+                col_tile * kColsPerTile,
+                valid_rows,
+                valid_cols);
+        }
         if (has_next) {
             FLASH_NAMESPACE::cp_async_wait<0>();
             __syncthreads();
