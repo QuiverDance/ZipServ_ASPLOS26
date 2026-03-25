@@ -77,14 +77,11 @@ struct ZipservBlockLoadState {
     int total_tiles;
     int max_col_tiles;
     int rows_to_load;
+    int block_rows;
     int global_tile_m_base;
     bool valid;
     ZipservGlobalTileInfo first_tile_info;
 };
-
-__forceinline__ __device__ size_t zipserv_output_buffer_bytes() {
-    return static_cast<size_t>(64 * (64 + PADDING_SHARED_MEM_FOR_DECOMP) * sizeof(__nv_bfloat16));
-}
 
 __forceinline__ __device__ size_t zipserv_scratch_buffer_bytes(const ZipservCompressedKVParams &comp) {
     constexpr size_t kMetadataBytes =
@@ -96,10 +93,6 @@ __forceinline__ __device__ size_t zipserv_scratch_buffer_bytes(const ZipservComp
     return zipserv_align_up(payload_bytes, 128);
 }
 
-__forceinline__ __device__ __nv_bfloat16 (*zipserv_get_output_buffer(char *zipserv_smem))[64 + PADDING_SHARED_MEM_FOR_DECOMP] {
-    return reinterpret_cast<__nv_bfloat16 (*)[64 + PADDING_SHARED_MEM_FOR_DECOMP]>(zipserv_smem);
-}
-
 __forceinline__ __device__ ZipservScratchBufferView zipserv_get_scratch_buffer(
     const ZipservCompressedKVParams &comp,
     char *zipserv_smem,
@@ -107,7 +100,6 @@ __forceinline__ __device__ ZipservScratchBufferView zipserv_get_scratch_buffer(
     const size_t bitmap_size = ZipservFlashConfig::TILE_BITMAP_M_V3 * ZipservFlashConfig::TILE_BITMAP_K_V3;
     char *buffer_base =
         zipserv_smem
-        + zipserv_align_up(zipserv_output_buffer_bytes(), 128)
         + buffer_idx * zipserv_scratch_buffer_bytes(comp);
     auto *bitmap1 = reinterpret_cast<uint64_t *>(buffer_base);
     auto *bitmap2 = bitmap1 + bitmap_size;
@@ -192,35 +184,6 @@ __forceinline__ __device__ void zipserv_zero_partition(TensorDst &dst) {
     }
 }
 
-template <typename Element, typename TensorDst, typename TensorCoord>
-__forceinline__ __device__ void zipserv_scatter_subtile(
-    TensorDst &dst,
-    const TensorCoord &coord,
-    const __nv_bfloat16 (*smem_output)[64 + PADDING_SHARED_MEM_FOR_DECOMP],
-    const int row_base,
-    const int col_base,
-    const int valid_rows,
-    const int valid_cols) {
-    #pragma unroll
-    for (int i = 0; i < size<0>(dst); ++i) {
-        #pragma unroll
-        for (int j = 0; j < size<1>(dst); ++j) {
-            #pragma unroll
-            for (int k = 0; k < size<2>(dst); ++k) {
-                const int row = get<0>(coord(i, j, k));
-                const int col = get<1>(coord(i, j, k));
-                if (row >= row_base && row < row_base + 64 && col >= col_base && col < col_base + 64) {
-                    const int local_row = row - row_base;
-                    const int local_col = col - col_base;
-                    dst(i, j, k) = (local_row < valid_rows && local_col < valid_cols)
-                        ? zipserv_convert_element<Element>(smem_output[local_row][local_col])
-                        : zipserv_zero_element<Element>();
-                }
-            }
-        }
-    }
-}
-
 __forceinline__ __device__ void zipserv_prefetch_global_tile_to_shared(
     const ZipservCompressedKVParams &comp,
     const int global_tile_m,
@@ -250,30 +213,102 @@ __forceinline__ __device__ void zipserv_prefetch_global_tile_to_shared(
     cp_async_group_commit();
 }
 
-__forceinline__ __device__ void zipserv_decompress_scratch_to_output(
+template <typename Element, typename TensorDst>
+__forceinline__ __device__ void zipserv_decompress_scratch_to_dst(
     const ZipservCompressedKVParams &comp,
     const ZipservGlobalTileInfo &tile_info,
     const ZipservScratchBufferView &scratch,
-    __nv_bfloat16 (*smem_output)[64 + PADDING_SHARED_MEM_FOR_DECOMP]) {
+    TensorDst &dst,
+    const int row_base,
+    const int col_base,
+    const int valid_rows,
+    const int valid_cols) {
     const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
     const int *median_offset_ptr = comp.tile_offsets_median + (tile_info.global_tile_idx * kZipservWarpsPerTile + warp_id) * 2;
-    const int warp_hf_start = median_offset_ptr[0];
-    const int warp_full_start = median_offset_ptr[1];
+    int warp_hf_start = median_offset_ptr[0];
+    int warp_full_start = median_offset_ptr[1];
     uint64_t *smem_bitmap1_warp = scratch.bitmap1 + warp_id * 2 * 8;
     uint64_t *smem_bitmap2_warp = scratch.bitmap2 + warp_id * 2 * 8;
     uint64_t *smem_bitmap3_warp = scratch.bitmap3 + warp_id * 2 * 8;
+    const int pos1 = lane_id << 1;
+    const int pos2 = pos1 + 1;
+    const int local_m = pos1 / 8;
+    const int local_k = pos1 % 8;
 
-    DecompressMedianTileToSharedMemory<ZipservFlashConfig>(
-        scratch.sign_mantissa,
-        scratch.full_values,
-        smem_bitmap1_warp,
-        smem_bitmap2_warp,
-        smem_bitmap3_warp,
-        warp_hf_start,
-        warp_full_start,
-        comp.start_exp,
-        smem_output,
-        warp_id);
+    #pragma unroll
+    for (int col_group = 0; col_group < 8; ++col_group) {
+        #pragma unroll
+        for (int row_group = 0; row_group < 2; ++row_group) {
+            const int small_tile_idx = col_group * 2 + row_group;
+            const uint64_t bitmap1 = smem_bitmap1_warp[small_tile_idx];
+            const uint64_t bitmap2 = smem_bitmap2_warp[small_tile_idx];
+            const uint64_t bitmap3 = smem_bitmap3_warp[small_tile_idx];
+            const uint64_t high_freq_indicator = bitmap1 | bitmap2 | bitmap3;
+
+            const uint8_t code_pos1 =
+                ((bitmap3 >> pos1) & 1ULL) << 2 |
+                ((bitmap2 >> pos1) & 1ULL) << 1 |
+                ((bitmap1 >> pos1) & 1ULL);
+            const uint8_t code_pos2 =
+                ((bitmap3 >> pos2) & 1ULL) << 2 |
+                ((bitmap2 >> pos2) & 1ULL) << 1 |
+                ((bitmap1 >> pos2) & 1ULL);
+            const uint16_t exponent_bits_pos1 = (comp.start_exp + code_pos1) << 7;
+            const uint16_t exponent_bits_pos2 = (comp.start_exp + code_pos2) << 7;
+
+            const uint64_t mask_before_pos1 = (1ULL << pos1) - 1;
+            const int high_freq_before_pos1 = __popcll(high_freq_indicator & mask_before_pos1);
+            const int low_freq_before_pos1 = pos1 - high_freq_before_pos1;
+            const bool is_high_freq_pos1 = (high_freq_indicator & (1ULL << pos1)) != 0;
+
+            __nv_bfloat16 val1;
+            if (is_high_freq_pos1) {
+                const uint8_t combined = scratch.sign_mantissa[warp_hf_start + high_freq_before_pos1];
+                const uint8_t sign = (combined >> 7) & 0x1;
+                const uint8_t mantissa = combined & 0x7F;
+                const uint16_t bf16_bits = ((sign & 0x1) << 15) | exponent_bits_pos1 | (mantissa & 0x7F);
+                val1 = __ushort_as_bfloat16(bf16_bits);
+            } else {
+                val1 = scratch.full_values[warp_full_start + low_freq_before_pos1];
+            }
+
+            const int high_freq_before_pos2 = high_freq_before_pos1 + (is_high_freq_pos1 ? 1 : 0);
+            const int low_freq_before_pos2 = pos2 - high_freq_before_pos2;
+            const bool is_high_freq_pos2 = (high_freq_indicator & (1ULL << pos2)) != 0;
+
+            __nv_bfloat16 val2;
+            if (is_high_freq_pos2) {
+                const uint8_t combined = scratch.sign_mantissa[warp_hf_start + high_freq_before_pos2];
+                const uint8_t sign = (combined >> 7) & 0x1;
+                const uint8_t mantissa = combined & 0x7F;
+                const uint16_t bf16_bits = ((sign & 0x1) << 15) | exponent_bits_pos2 | (mantissa & 0x7F);
+                val2 = __ushort_as_bfloat16(bf16_bits);
+            } else {
+                val2 = scratch.full_values[warp_full_start + low_freq_before_pos2];
+            }
+
+            const int tile_row = warp_id * 16 + row_group * 8 + local_m;
+            const int tile_col = col_group * 8 + local_k;
+            if (tile_row < valid_rows) {
+                const int dst_row = row_base + tile_row;
+                const int dst_col = col_base + tile_col;
+                if (tile_col < valid_cols) {
+                    dst(dst_row, dst_col) = zipserv_convert_element<Element>(val1);
+                }
+                if (tile_col + 1 < valid_cols) {
+                    dst(dst_row, dst_col + 1) = zipserv_convert_element<Element>(val2);
+                }
+            }
+
+            const int num_high_freq_lane_31 = __shfl_sync(
+                0xffffffff,
+                high_freq_before_pos2 + (is_high_freq_pos2 ? 1 : 0),
+                31);
+            warp_hf_start += num_high_freq_lane_31;
+            warp_full_start += 64 - num_high_freq_lane_31;
+        }
+    }
     __syncthreads();
 }
 
@@ -298,6 +333,7 @@ __forceinline__ __device__ ZipservBlockLoadState zipserv_begin_block_load(
     load_state.total_tiles = total_tiles;
     load_state.max_col_tiles = max_col_tiles;
     load_state.rows_to_load = rows_to_load;
+    load_state.block_rows = block_rows;
     load_state.global_tile_m_base = head_row_base / kRowsPerTile;
     load_state.valid = total_tiles > 0;
     if (total_tiles == 0) {
@@ -314,24 +350,25 @@ __forceinline__ __device__ ZipservBlockLoadState zipserv_begin_block_load(
     return load_state;
 }
 
-template <typename Element, typename TensorDst, typename TensorCoord>
+template <typename Element, typename TensorSmem, typename TensorThread>
 __forceinline__ __device__ void zipserv_finish_block_load(
     const ZipservCompressedKVParams &comp,
     const ZipservBlockLoadState &load_state,
-    TensorDst &dst,
-    const TensorCoord &coord,
+    TensorSmem &dst_smem,
+    TensorThread &dst_thread,
     char *zipserv_smem) {
-    zipserv_zero_partition<Element>(dst);
+    constexpr int kRowsPerTile = 64;
+    constexpr int kColsPerTile = 64;
+    const bool needs_zero_fill = load_state.rows_to_load < load_state.block_rows || (comp.cols % kColsPerTile) != 0;
+    if (needs_zero_fill) {
+        zipserv_zero_partition<Element>(dst_thread);
+    }
     if (!load_state.valid) {
         __syncthreads();
         return;
     }
 
-    constexpr int kRowsPerTile = 64;
-    constexpr int kColsPerTile = 64;
-    auto smem_output = zipserv_get_output_buffer(zipserv_smem);
     ZipservGlobalTileInfo current_tile_info = load_state.first_tile_info;
-    ZipservGlobalTileInfo next_tile_info;
     auto current_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, 0);
 
     for (int tile_idx = 0; tile_idx < load_state.total_tiles; ++tile_idx) {
@@ -339,6 +376,7 @@ __forceinline__ __device__ void zipserv_finish_block_load(
         const int col_tile = tile_idx % load_state.max_col_tiles;
         const int tile_row_base = row_tile * kRowsPerTile;
         const bool has_next = tile_idx + 1 < load_state.total_tiles;
+        ZipservGlobalTileInfo next_tile_info;
         auto next_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, (tile_idx + 1) & 1);
 
         if (has_next) {
@@ -352,17 +390,15 @@ __forceinline__ __device__ void zipserv_finish_block_load(
                 next_tile_info);
         }
 
-        zipserv_decompress_scratch_to_output(comp, current_tile_info, current_scratch, smem_output);
-        zipserv_scatter_subtile<Element>(
-            dst,
-            coord,
-            smem_output,
+        zipserv_decompress_scratch_to_dst<Element>(
+            comp,
+            current_tile_info,
+            current_scratch,
+            dst_smem,
             tile_row_base,
             col_tile * kColsPerTile,
             zipserv_valid_rows(load_state.rows_to_load, tile_row_base, kRowsPerTile),
             min(kColsPerTile, comp.cols - col_tile * kColsPerTile));
-        __syncthreads();
-
         if (has_next) {
             FLASH_NAMESPACE::cp_async_wait<0>();
             __syncthreads();
@@ -373,7 +409,7 @@ __forceinline__ __device__ void zipserv_finish_block_load(
     __syncthreads();
 }
 
-template <typename Element, typename TensorDst, typename TensorCoord>
+template <typename Element, typename TensorSmem, typename TensorThread>
 __forceinline__ __device__ void zipserv_load_block_to_smem(
     const ZipservCompressedKVParams &comp,
     const int batch_idx,
@@ -381,8 +417,8 @@ __forceinline__ __device__ void zipserv_load_block_to_smem(
     const int block_row,
     const int total_valid_rows,
     const int block_rows,
-    TensorDst &dst,
-    const TensorCoord &coord,
+    TensorSmem &dst_smem,
+    TensorThread &dst_thread,
     char *zipserv_smem) {
     const auto load_state = zipserv_begin_block_load(
         comp,
@@ -394,7 +430,7 @@ __forceinline__ __device__ void zipserv_load_block_to_smem(
         zipserv_smem);
     FLASH_NAMESPACE::cp_async_wait<0>();
     __syncthreads();
-    zipserv_finish_block_load<Element>(comp, load_state, dst, coord, zipserv_smem);
+    zipserv_finish_block_load<Element>(comp, load_state, dst_smem, dst_thread, zipserv_smem);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -693,7 +729,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, sK, tKsK, zipserv_smem);
         }
 
         // Advance gV
@@ -732,7 +768,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, sV, tVsV, zipserv_smem);
         }
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {
@@ -795,7 +831,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, sK, tKsK, zipserv_smem);
         }
         if (params.has_zipserv_kv) {
             zipserv_v_load_state = zipserv_begin_block_load(
@@ -822,7 +858,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, sV, tVsV, zipserv_smem);
         }
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {
@@ -1313,7 +1349,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, sK, tKsK, zipserv_smem);
         }
 
         // Advance gV
@@ -1362,7 +1398,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, sV, tVsV, zipserv_smem);
         }
         // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tVsV); }
         // __syncthreads();
@@ -1423,7 +1459,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, tKsK, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_k, zipserv_k_load_state, sK, tKsK, zipserv_smem);
         }
         // Advance gV
         if (params.has_zipserv_kv) {
@@ -1460,7 +1496,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (params.has_zipserv_kv) {
-            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, tVsV, tKVcKV, zipserv_smem);
+            zipserv_finish_block_load<Element>(params.zipserv_v, zipserv_v_load_state, sV, tVsV, zipserv_smem);
         }
         if (n_block > n_block_min) {
             if (params.has_zipserv_kv) {

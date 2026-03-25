@@ -700,18 +700,26 @@ def make_flash_attn_zipserv_runner(
     return runner
 
 
-def time_cuda(fn, warmup: int, iters: int):
+def time_cuda(fn, warmup: int, iters: int, nvtx_label: str | None = None):
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
     out = None
+    if nvtx_label is not None:
+        torch.cuda.nvtx.range_push(f"warmup::{nvtx_label}")
     for _ in range(warmup):
         out = fn()
+    if nvtx_label is not None:
+        torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
+    if nvtx_label is not None:
+        torch.cuda.nvtx.range_push(f"timed::{nvtx_label}")
     start.record()
     for _ in range(iters):
         out = fn()
     stop.record()
     stop.synchronize()
+    if nvtx_label is not None:
+        torch.cuda.nvtx.range_pop()
     return out, start.elapsed_time(stop) / iters
 
 
@@ -737,11 +745,13 @@ def benchmark_one(
     cache_batch_size: int | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, float | str | int]]:
     out = None
+    batch_size = int(dense_k.shape[0])
+    nvtx_label = f"{mode}|b{batch_size}|kv{kv_len}|qh{num_q_heads}|kvh{kv_heads}|d{head_dim}"
 
     if mode == "direct":
         if runner is None:
             raise ValueError("direct mode requires a prepared attention runner")
-        out, latency_ms = time_cuda(lambda: runner(dense_k, dense_v), warmup, iters)
+        out, latency_ms = time_cuda(lambda: runner(dense_k, dense_v), warmup, iters, nvtx_label=nvtx_label)
     elif mode == "staged_dense":
         if runner is None:
             raise ValueError("staged_dense mode requires a prepared attention runner")
@@ -770,7 +780,7 @@ def benchmark_one(
             )
             return runner(k, v)
 
-        out, latency_ms = time_cuda(staged_dense, warmup, iters)
+        out, latency_ms = time_cuda(staged_dense, warmup, iters, nvtx_label=nvtx_label)
     elif mode == "staged_paged":
         if runner is None:
             raise ValueError("staged_paged mode requires a prepared attention runner")
@@ -803,11 +813,11 @@ def benchmark_one(
             )
             return runner(k, v)
 
-        out, latency_ms = time_cuda(staged_paged, warmup, iters)
+        out, latency_ms = time_cuda(staged_paged, warmup, iters, nvtx_label=nvtx_label)
     elif mode == FUSED_FLASH_ATTN_MODE:
         if zipserv_runner is None:
             raise ValueError(f"{mode} requires a prepared ZipServ fused runner")
-        out, latency_ms = time_cuda(zipserv_runner, warmup, iters)
+        out, latency_ms = time_cuda(zipserv_runner, warmup, iters, nvtx_label=nvtx_label)
     else:
         raise ValueError(f"Unknown mode: {mode}")
 

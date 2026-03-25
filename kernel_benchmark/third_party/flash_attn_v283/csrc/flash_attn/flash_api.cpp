@@ -81,8 +81,6 @@ void check_zipserv_compressed(
 size_t zipserv_shared_bytes(int max_high_freq_count, int max_full_count) {
     const size_t padded_high_freq =
         static_cast<size_t>(max_high_freq_count + ((128 - (max_high_freq_count % 128)) % 128));
-    const size_t output_bytes =
-        align_up(static_cast<size_t>(kZipservTileRows) * (kZipservTileCols + kZipservSharedPadding) * sizeof(__nv_bfloat16), 128);
     const size_t metadata_bytes =
         static_cast<size_t>((2 * kZipservWarpsPerTile + kZipservWarpsPerTile * kZipservSmallTilesPerWarp) * sizeof(int));
     const size_t per_buffer_bytes = align_up(
@@ -92,7 +90,6 @@ size_t zipserv_shared_bytes(int max_high_freq_count, int max_full_count) {
             + metadata_bytes,
         128);
     return 127
-        + output_bytes
         + 2 * per_buffer_bytes;
 }
 

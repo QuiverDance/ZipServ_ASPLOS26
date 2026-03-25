@@ -4,6 +4,7 @@
 
 #pragma once
 #include "namespace_config.h"
+#include <cstdlib>
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
 #include "static_switch.h"
@@ -12,6 +13,11 @@
 #include "flash_fwd_kernel.h"
 
 namespace FLASH_NAMESPACE {
+
+inline int zipserv_hdim128_noncausal_kernel_choice() {
+    const char* choice = std::getenv("ZIPSERV_HDIM128_NONCAUSAL_KERNEL");
+    return choice != nullptr ? std::atoi(choice) : 0;
+}
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -316,7 +322,17 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                     // of K/V tile loads versus a 64x64 kernel. Prefer the squarer kernel only
                     // for this ZipServ-specific small-seqlen regular path.
                     if (params.has_zipserv_kv && params.seqlen_q <= 16) {
-                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                        switch (zipserv_hdim128_noncausal_kernel_choice()) {
+                            case 1:
+                                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                                break;
+                            case 2:
+                                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                                break;
+                            default:
+                                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                                break;
+                        }
                     } else {
                         run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                     }
