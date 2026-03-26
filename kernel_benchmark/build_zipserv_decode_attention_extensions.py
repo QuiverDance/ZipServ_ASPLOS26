@@ -63,7 +63,14 @@ def build_flash_attn_2_cuda_extension(verbose: bool, regular_only: bool = False)
     build_dir = FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR if regular_only else FLASH_ATTN_EXT_BUILD_DIR
     build_dir.mkdir(parents=True, exist_ok=True)
     flash_attn_src_dir = FLASH_ATTN_ROOT / "csrc" / "flash_attn" / "src"
-    flash_attn_patterns = ["flash_fwd_hdim*_sm80.cu"] if regular_only else ["flash_*_sm80.cu"]
+    if regular_only:
+        flash_attn_patterns = ["flash_fwd_hdim*_sm80.cu"]
+        common_defines = ["-DFLASHATTENTION_DISABLE_BACKWARD", "-DFLASHATTENTION_DISABLE_SPLITKV"]
+    else:
+        # The decode benchmark only exercises forward kernels, so avoid compiling the
+        # backward translation units for split-kv builds as well.
+        flash_attn_patterns = ["flash_fwd_hdim*_sm80.cu", "flash_fwd_split_hdim*_sm80.cu"]
+        common_defines = ["-DFLASHATTENTION_DISABLE_BACKWARD"]
     flash_attn_sources = [
         str(FLASH_ATTN_ROOT / "csrc" / "flash_attn" / "flash_api.cpp"),
         *[
@@ -72,7 +79,6 @@ def build_flash_attn_2_cuda_extension(verbose: bool, regular_only: bool = False)
             for path in sorted(flash_attn_src_dir.glob(pattern))
         ],
     ]
-    common_defines = ["-DFLASHATTENTION_DISABLE_BACKWARD"] if regular_only else []
     load(
         name=FLASH_ATTN_EXT_NAME,
         sources=flash_attn_sources,
@@ -88,9 +94,8 @@ def build_flash_attn_2_cuda_extension(verbose: bool, regular_only: bool = False)
             "--std=c++17",
             "-lineinfo",
             *common_defines,
-            *([] if not regular_only else ["-DFLASHATTENTION_DISABLE_SPLITKV"]),
         ],
-        extra_cflags=["-O3", "-std=c++17", *common_defines, *([] if not regular_only else ["-DFLASHATTENTION_DISABLE_SPLITKV"])],
+        extra_cflags=["-O3", "-std=c++17", *common_defines],
         build_directory=str(build_dir),
         verbose=verbose,
     )
