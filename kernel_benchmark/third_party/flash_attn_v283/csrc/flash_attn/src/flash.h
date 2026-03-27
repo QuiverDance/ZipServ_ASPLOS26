@@ -16,6 +16,8 @@ namespace FLASH_NAMESPACE {
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;
+constexpr int ZIPSERV_LAYOUT_HEAD_MAJOR = 0;
+constexpr int ZIPSERV_LAYOUT_TOKEN_MAJOR = 1;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -62,6 +64,7 @@ struct ZipservCompressedKVParams {
     int max_high_freq_count;
     int max_full_count;
     int start_exp;
+    int layout;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

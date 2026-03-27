@@ -35,6 +35,13 @@ _ZIPSERV_FIELDS = (
     "start_exp",
 )
 
+_ZIPSERV_LAYOUT_IDS = {
+    "by_kv_head": 0,
+    "dense": 1,
+    "paged": 1,
+    "token_major": 1,
+}
+
 
 def _maybe_make_zipserv_kv_placeholders(
     q: torch.Tensor,
@@ -75,14 +82,19 @@ def _normalize_zipserv_kv(
 ):
     if desc is None:
         return None
+    layout_value = "by_kv_head"
     if isinstance(desc, dict):
         values = tuple(desc[field] for field in _ZIPSERV_FIELDS)
+        layout_value = desc.get("layout", layout_value)
     elif isinstance(desc, Sequence) and not isinstance(desc, (str, bytes)):
-        if len(desc) != len(_ZIPSERV_FIELDS):
-            raise ValueError(f"{name} must have {len(_ZIPSERV_FIELDS)} elements")
-        values = tuple(desc)
+        if len(desc) not in {len(_ZIPSERV_FIELDS), len(_ZIPSERV_FIELDS) + 1}:
+            raise ValueError(f"{name} must have {len(_ZIPSERV_FIELDS)} or {len(_ZIPSERV_FIELDS) + 1} elements")
+        values = tuple(desc[: len(_ZIPSERV_FIELDS)])
+        if len(desc) == len(_ZIPSERV_FIELDS) + 1:
+            layout_value = desc[-1]
     else:
         values = tuple(getattr(desc, field) for field in _ZIPSERV_FIELDS)
+        layout_value = getattr(desc, "layout", layout_value)
 
     tensors = []
     for field, value in zip(_ZIPSERV_FIELDS[:7], values[:7]):
@@ -101,6 +113,9 @@ def _normalize_zipserv_kv(
     if batch_stride_rows % num_heads_k != 0:
         raise ValueError(f"{name}.rows must encode an integer rows-per-head for num_heads_k={num_heads_k}")
     head_stride_rows = batch_stride_rows // num_heads_k
+    layout_id = _ZIPSERV_LAYOUT_IDS.get(str(layout_value), None)
+    if layout_id is None:
+        raise ValueError(f"{name}.layout must be one of {sorted(_ZIPSERV_LAYOUT_IDS)}")
     return tuple(tensors) + (
         rows,
         cols,
@@ -109,6 +124,7 @@ def _normalize_zipserv_kv(
         max_high_freq_count,
         max_full_count,
         start_exp,
+        layout_id,
     )
 
 
@@ -1711,7 +1727,7 @@ def flash_attn_with_kvcache(
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     cache_leftpad = maybe_contiguous(cache_leftpad)
     block_table = maybe_contiguous(block_table)
-    zipserv_args = ((None,) * 7 + (0,) * 7) * 2
+    zipserv_args = ((None,) * 7 + (0,) * 8) * 2
     if zipserv_k is not None:
         zipserv_args = (*zipserv_k, *zipserv_v)
     out, softmax_lse = flash_attn_gpu.fwd_kvcache(

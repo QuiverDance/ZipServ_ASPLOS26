@@ -109,7 +109,8 @@ void set_zipserv_params(
     const int head_stride_rows,
     const int max_high_freq_count,
     const int max_full_count,
-    const int start_exp) {
+    const int start_exp,
+    const int layout) {
     dst.sign_mantissa = sign_mantissa.data_ptr<uint8_t>();
     dst.compressed_full = reinterpret_cast<const __nv_bfloat16 *>(compressed_full.data_ptr());
     dst.bitmap1 = bitmap1.data_ptr<uint64_t>();
@@ -124,6 +125,7 @@ void set_zipserv_params(
     dst.max_high_freq_count = max_high_freq_count;
     dst.max_full_count = max_full_count;
     dst.start_exp = start_exp;
+    dst.layout = layout;
     params.zipserv_smem_bytes = std::max<int>(
         params.zipserv_smem_bytes,
         static_cast<int>(zipserv_shared_bytes(max_high_freq_count, max_full_count)));
@@ -1355,6 +1357,7 @@ mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x n
                      int zipserv_k_max_high_freq_count,
                      int zipserv_k_max_full_count,
                      int zipserv_k_start_exp,
+                     int zipserv_k_layout,
                      std::optional<const at::Tensor> &zipserv_v_sign_mantissa_,
                      std::optional<const at::Tensor> &zipserv_v_compressed_full_,
                      std::optional<const at::Tensor> &zipserv_v_bitmap1_,
@@ -1368,7 +1371,8 @@ mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x n
                      int zipserv_v_head_stride_rows,
                      int zipserv_v_max_high_freq_count,
                      int zipserv_v_max_full_count,
-                     int zipserv_v_start_exp) {
+                     int zipserv_v_start_exp,
+                     int zipserv_v_layout) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -1483,8 +1487,8 @@ mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x n
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     if (zipserv_kv) {
         TORCH_CHECK(head_size_og % 8 == 0, "ZipServ KV path requires head_size to be a multiple of 8");
-        TORCH_CHECK(zipserv_k_head_stride_rows > 0 && zipserv_k_head_stride_rows % 64 == 0,
-            "ZipServ K metadata head_stride_rows must be a positive multiple of 64");
+        TORCH_CHECK(zipserv_k_head_stride_rows > 0,
+            "ZipServ K metadata head_stride_rows must be positive");
         TORCH_CHECK(zipserv_v_head_stride_rows == zipserv_k_head_stride_rows,
             "ZipServ K/V metadata must agree on head_stride_rows");
         TORCH_CHECK(zipserv_k_batch_stride_rows > 0 && zipserv_k_batch_stride_rows % zipserv_k_head_stride_rows == 0,
@@ -1503,6 +1507,17 @@ mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x n
             "ZipServ K layout must encode one contiguous row-stride slab per KV head");
         TORCH_CHECK(zipserv_v_batch_stride_rows / zipserv_v_head_stride_rows == num_heads_k,
             "ZipServ V layout must encode one contiguous row-stride slab per KV head");
+        TORCH_CHECK(zipserv_k_layout == zipserv_v_layout, "ZipServ K/V metadata must agree on layout");
+        TORCH_CHECK(
+            zipserv_k_layout == ZIPSERV_LAYOUT_HEAD_MAJOR || zipserv_k_layout == ZIPSERV_LAYOUT_TOKEN_MAJOR,
+            "ZipServ layout must be head-major or token-major");
+        if (zipserv_k_layout == ZIPSERV_LAYOUT_HEAD_MAJOR) {
+            TORCH_CHECK(zipserv_k_head_stride_rows % 64 == 0,
+                "ZipServ K metadata head_stride_rows must be a positive multiple of 64");
+        } else {
+            TORCH_CHECK(64 % num_heads_k == 0,
+                "ZipServ token-major layout requires num_heads_k to divide 64");
+        }
     } else if (!paged_KV) {
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
         CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
@@ -1717,7 +1732,8 @@ mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x n
             zipserv_k_head_stride_rows,
             zipserv_k_max_high_freq_count,
             zipserv_k_max_full_count,
-            zipserv_k_start_exp);
+            zipserv_k_start_exp,
+            zipserv_k_layout);
         set_zipserv_params(
             params,
             params.zipserv_v,
@@ -1734,7 +1750,8 @@ mha_fwd_kvcache_impl(at::Tensor &q,                 // batch_size x seqlen_q x n
             zipserv_v_head_stride_rows,
             zipserv_v_max_high_freq_count,
             zipserv_v_max_full_count,
-            zipserv_v_start_exp);
+            zipserv_v_start_exp,
+            zipserv_v_layout);
         params.has_zipserv_kv = true;
     }
 
@@ -1802,6 +1819,7 @@ mha_fwd_kvcache(at::Tensor &q,
                 int zipserv_k_max_high_freq_count,
                 int zipserv_k_max_full_count,
                 int zipserv_k_start_exp,
+                int zipserv_k_layout,
                 std::optional<const at::Tensor> &zipserv_v_sign_mantissa_,
                 std::optional<const at::Tensor> &zipserv_v_compressed_full_,
                 std::optional<const at::Tensor> &zipserv_v_bitmap1_,
@@ -1815,7 +1833,8 @@ mha_fwd_kvcache(at::Tensor &q,
                 int zipserv_v_head_stride_rows,
                 int zipserv_v_max_high_freq_count,
                 int zipserv_v_max_full_count,
-                int zipserv_v_start_exp) {
+                int zipserv_v_start_exp,
+                int zipserv_v_layout) {
     return mha_fwd_kvcache_impl(
         q,
         kcache,
@@ -1851,6 +1870,7 @@ mha_fwd_kvcache(at::Tensor &q,
         zipserv_k_max_high_freq_count,
         zipserv_k_max_full_count,
         zipserv_k_start_exp,
+        zipserv_k_layout,
         zipserv_v_sign_mantissa_,
         zipserv_v_compressed_full_,
         zipserv_v_bitmap1_,
@@ -1864,7 +1884,8 @@ mha_fwd_kvcache(at::Tensor &q,
         zipserv_v_head_stride_rows,
         zipserv_v_max_high_freq_count,
         zipserv_v_max_full_count,
-        zipserv_v_start_exp);
+        zipserv_v_start_exp,
+        zipserv_v_layout);
 }
 } // namespace FLASH_NAMESPACE
 

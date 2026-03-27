@@ -29,11 +29,19 @@ FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR = PREBUILT_EXT_ROOT / f"{FLASH_ATTN_EXT_NA
 DEFAULT_KV_LEN = 1020
 FLASHINFER_PAGE_BLOCK_SIZE = 16
 FLASHINFER_WORKSPACE_BYTES = 128 * 1024 * 1024
+FUSED_LAYOUT_CHOICES = ("dense", "paged", "by_kv_head")
 FLASH_ATTN_MODE = "flashattn"
 FLASHINFER_MODE = "flashinfer"
 STAGED_FLASH_ATTN_MODE = "staged_flashattn"
 STAGED_FLASHINFER_MODE = "staged_flashinfer"
 FUSED_FLASH_ATTN_MODE = "fused_flashattn"
+SUPPORTED_MODES = {
+    FLASH_ATTN_MODE,
+    FLASHINFER_MODE,
+    STAGED_FLASH_ATTN_MODE,
+    STAGED_FLASHINFER_MODE,
+    FUSED_FLASH_ATTN_MODE,
+}
 
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
 
@@ -66,6 +74,21 @@ class KVPair:
     v: torch.Tensor
     k_name: str
     v_name: str
+
+
+@dataclass
+class BenchmarkContext:
+    ext: object
+    device: torch.device
+    q_weight: torch.Tensor
+    hidden_size: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    kv_pairs: List[KVPair]
+    kv_pair_offset: int
+    fused_regular_only: bool
+    fused_layout: str
 
 
 def parse_csv_ints(spec: str) -> List[int]:
@@ -126,7 +149,7 @@ def normalize_modes(spec: str) -> List[str]:
     return normalized
 
 
-def zipserv_descriptor(comp: ZipservCompressed) -> Dict[str, object]:
+def zipserv_descriptor(comp: ZipservCompressed, layout: str = "by_kv_head") -> Dict[str, object]:
     return {
         "sign_mantissa": comp.sign_mantissa,
         "compressed_full": comp.compressed_full,
@@ -140,20 +163,14 @@ def zipserv_descriptor(comp: ZipservCompressed) -> Dict[str, object]:
         "max_high_freq_count": comp.max_high_freq_count,
         "max_full_count": comp.max_full_count,
         "start_exp": comp.start_exp,
+        "layout": layout,
     }
-
-
-def ensure_extension_built(build_target: str) -> None:
-    import build_zipserv_decode_attention_extensions as ext_builder
-
-    ext_builder.ensure_extension_built(build_target)
 
 
 def load_prebuilt_extension(
     module_name: str,
     build_dir: Path,
     build_hint: str,
-    build_target: str,
     *,
     reload_module: bool = False,
 ) -> object:
@@ -173,9 +190,6 @@ def load_prebuilt_extension(
 
     candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not candidates:
-        ensure_extension_built(build_target)
-        candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
-    if not candidates:
         raise RuntimeError(
             f"Prebuilt extension '{module_name}' not found under {build_dir}. "
             f"Build it first with:\n{build_hint}"
@@ -187,46 +201,56 @@ def load_prebuilt_extension(
         return sys.modules[module_name]
     try:
         return import_module_from_path(so_path)
-    except Exception as first_exc:
-        ensure_extension_built(build_target)
-        candidates = sorted(build_dir.glob(f"{module_name}*.so"), key=lambda path: path.stat().st_mtime, reverse=True)
-        if not candidates:
-            raise RuntimeError(
-                f"Prebuilt extension '{module_name}' could not be rebuilt under {build_dir}. "
-                f"Build it first with:\n{build_hint}"
-            ) from first_exc
-        try:
-            return import_module_from_path(candidates[0])
-        except Exception as second_exc:
-            raise RuntimeError(
-                f"Failed to load extension '{module_name}' from {candidates[0]}.\n"
-                f"First load error: {first_exc}\n"
-                f"After rebuild: {second_exc}"
-            ) from second_exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load prebuilt extension '{module_name}' from {so_path}. "
+            f"Rebuild it first with:\n{build_hint}\n"
+            f"Original load error: {exc}"
+        ) from exc
 
 
 def load_zipserv_extension() -> object:
     build_hint = (
         "python build_zipserv_decode_attention_extensions.py --target zipserv"
     )
-    return load_prebuilt_extension(EXT_NAME, ZIPSERV_EXT_BUILD_DIR, build_hint, "zipserv")
+    return load_prebuilt_extension(EXT_NAME, ZIPSERV_EXT_BUILD_DIR, build_hint)
 
 
 def load_integrated_flash_attn_extension(regular_only: bool = True) -> object:
     build_hint = "python build_zipserv_decode_attention_extensions.py --target zipserv_flashattn"
     build_dir = FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR
-    build_target = "zipserv_flashattn"
     if not regular_only:
         build_hint = "python build_zipserv_decode_attention_extensions.py --target zipserv_flashattn_splitkv"
         build_dir = FLASH_ATTN_EXT_BUILD_DIR
-        build_target = "zipserv_flashattn_splitkv"
     return load_prebuilt_extension(
         FLASH_ATTN_EXT_NAME,
         build_dir,
         build_hint,
-        build_target,
         reload_module=True,
     )
+
+
+def clear_flash_attn_modules() -> None:
+    for module_name in list(sys.modules):
+        if module_name == "flash_attn" or module_name.startswith("flash_attn."):
+            sys.modules.pop(module_name, None)
+
+
+def import_flash_attn_with_kvcache(prepend_path: Path | None = None) -> Callable[..., torch.Tensor]:
+    added_path = False
+    if prepend_path is not None:
+        path_str = str(prepend_path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+            added_path = True
+    clear_flash_attn_modules()
+    try:
+        from flash_attn import flash_attn_with_kvcache
+
+        return flash_attn_with_kvcache
+    finally:
+        if prepend_path is not None and added_path:
+            sys.path.remove(str(prepend_path))
 
 
 def load_model_config(model_root: Path) -> Dict[str, object]:
@@ -503,83 +527,14 @@ def availability_or_raise(modes: Iterable[str]) -> None:
             import flashinfer.decode  # noqa: F401
         except Exception as exc:
             raise RuntimeError(f"flashinfer backend is unavailable: {exc}") from exc
-    if mode_set & {FLASH_ATTN_MODE, STAGED_FLASH_ATTN_MODE} and not (mode_set & {FUSED_FLASH_ATTN_MODE}):
-        load_flash_attn_with_kvcache(prefer_loaded_extension=False)
+    if mode_set & {FLASH_ATTN_MODE, STAGED_FLASH_ATTN_MODE}:
+        load_stock_flash_attn_with_kvcache()
 
 
-def load_flash_attn_with_kvcache(
-    use_integrated_zipserv: bool = False,
-    prefer_loaded_extension: bool = True,
-    integrated_regular_only: bool = True,
-) -> Callable[..., torch.Tensor]:
+def load_stock_flash_attn_with_kvcache() -> Callable[..., torch.Tensor]:
     vendored_root = SCRIPT_DIR / "third_party" / "flash_attn_v283"
-
-    def clear_flash_attn_modules() -> None:
-        for module_name in list(sys.modules):
-            if module_name == "flash_attn" or module_name.startswith("flash_attn."):
-                sys.modules.pop(module_name, None)
-
-    def import_flash_attn_with_kvcache(prepend_path: Path | None = None) -> Callable[..., torch.Tensor]:
-        added_path = False
-        if prepend_path is not None:
-            path_str = str(prepend_path)
-            if path_str not in sys.path:
-                sys.path.insert(0, path_str)
-                added_path = True
-        clear_flash_attn_modules()
-        try:
-            from flash_attn import flash_attn_with_kvcache
-            return flash_attn_with_kvcache
-        finally:
-            if prepend_path is not None and added_path:
-                sys.path.remove(str(prepend_path))
-
-    def using_integrated_flash_attn_extension() -> bool:
-        module = sys.modules.get(FLASH_ATTN_EXT_NAME)
-        module_path = getattr(module, "__file__", None)
-        if module_path is None:
-            return False
-        try:
-            resolved_path = Path(module_path).resolve()
-            return (
-                resolved_path.is_relative_to(FLASH_ATTN_EXT_BUILD_DIR.resolve())
-                or resolved_path.is_relative_to(FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR.resolve())
-            )
-        except AttributeError:
-            resolved = str(Path(module_path).resolve())
-            return (
-                resolved.startswith(str(FLASH_ATTN_EXT_BUILD_DIR.resolve()))
-                or resolved.startswith(str(FLASH_ATTN_REGULAR_ONLY_EXT_BUILD_DIR.resolve()))
-            )
-
+    sys.modules.pop(FLASH_ATTN_EXT_NAME, None)
     vendored_exc: Exception | None = None
-    if use_integrated_zipserv:
-        if not vendored_root.is_dir():
-            raise RuntimeError(
-                "ZipServ-integrated flash_attn requires the vendored flash_attn_v283 package to be present."
-            )
-        try:
-            sys.modules.pop(FLASH_ATTN_EXT_NAME, None)
-            load_integrated_flash_attn_extension(regular_only=integrated_regular_only)
-            return import_flash_attn_with_kvcache(vendored_root)
-        except Exception as exc:
-            raise RuntimeError(
-                "ZipServ-integrated flash_attn requires the vendored flash_attn_v283 package to be importable."
-            ) from exc
-
-    if not prefer_loaded_extension:
-        sys.modules.pop(FLASH_ATTN_EXT_NAME, None)
-
-    if prefer_loaded_extension and using_integrated_flash_attn_extension():
-        if not vendored_root.is_dir():
-            raise RuntimeError(
-                "Integrated flash_attn_2_cuda is loaded, but the vendored flash_attn_v283 Python wrapper is missing."
-            )
-        try:
-            return import_flash_attn_with_kvcache(vendored_root)
-        except Exception as exc:
-            vendored_exc = exc
-
     try:
         return import_flash_attn_with_kvcache()
     except Exception as site_exc:
@@ -593,6 +548,22 @@ def load_flash_attn_with_kvcache(
             "flash_attn staged baseline is unavailable. Install flash-attn in the active environment "
             "or make the vendored flash_attn_v283 package importable."
         ) from cause
+
+
+def load_integrated_flash_attn_with_kvcache(regular_only: bool = True) -> Callable[..., torch.Tensor]:
+    vendored_root = SCRIPT_DIR / "third_party" / "flash_attn_v283"
+    if not vendored_root.is_dir():
+        raise RuntimeError(
+            "ZipServ-integrated flash_attn requires the vendored flash_attn_v283 package to be present."
+        )
+    try:
+        sys.modules.pop(FLASH_ATTN_EXT_NAME, None)
+        load_integrated_flash_attn_extension(regular_only=regular_only)
+        return import_flash_attn_with_kvcache(vendored_root)
+    except Exception as exc:
+        raise RuntimeError(
+            "ZipServ-integrated flash_attn requires the vendored flash_attn_v283 package to be importable."
+        ) from exc
 
 
 def make_flashinfer_runner(
@@ -636,68 +607,69 @@ def make_flashinfer_runner(
     return runner
 
 
-def make_flash_attn_stage_runner(
+def make_flash_attn_runner(
     q: torch.Tensor,
     kv_len: int,
-    use_integrated_extension: bool = False,
+    flash_attn_with_kvcache: Callable[..., torch.Tensor],
     force_regular: bool = True,
-) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    flash_attn_with_kvcache = load_flash_attn_with_kvcache(
-        use_integrated_zipserv=use_integrated_extension,
-        prefer_loaded_extension=use_integrated_extension,
-        integrated_regular_only=use_integrated_extension and force_regular,
-    )
+    kv_heads: int | None = None,
+    comp_pair: Tuple[ZipservCompressed, ZipservCompressed] | None = None,
+    layout: str = "by_kv_head",
+) -> Callable[..., torch.Tensor]:
     batch_size, num_q_heads, head_dim = q.shape
     q_4d = q.view(batch_size, 1, num_q_heads, head_dim).contiguous()
-    cache_seqlens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=q.device)
-    cache_batch_idx = None if force_regular else torch.arange(batch_size, dtype=torch.int32, device=q.device)
+    kwargs = {
+        "cache_seqlens": torch.full((batch_size,), kv_len, dtype=torch.int32, device=q.device),
+        "num_splits": 1 if force_regular else 0,
+    }
+    if comp_pair is None:
+        if not force_regular:
+            kwargs["cache_batch_idx"] = torch.arange(batch_size, dtype=torch.int32, device=q.device)
 
-    def runner(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        kwargs = {"cache_seqlens": cache_seqlens}
-        if cache_batch_idx is not None:
-            kwargs["cache_batch_idx"] = cache_batch_idx
-        if force_regular:
-            kwargs["num_splits"] = 1
-        out_4d = flash_attn_with_kvcache(q_4d, k, v, **kwargs)
+        def runner(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            out_4d = flash_attn_with_kvcache(q_4d, k, v, **kwargs)
+            return out_4d.squeeze(1)
+
+        return runner
+
+    if kv_heads is None:
+        raise ValueError("kv_heads is required for ZipServ fused FlashAttention")
+    k_cache = torch.empty((batch_size, 1, kv_heads, head_dim), dtype=q.dtype, device=q.device)
+    v_cache = torch.empty_like(k_cache)
+    kwargs.update(
+        zipserv_k=zipserv_descriptor(comp_pair[0], layout=layout),
+        zipserv_v=zipserv_descriptor(comp_pair[1], layout=layout),
+        zipserv_num_heads_k=kv_heads,
+    )
+
+    def runner() -> torch.Tensor:
+        out_4d = flash_attn_with_kvcache(q_4d, k_cache, v_cache, **kwargs)
         return out_4d.squeeze(1)
 
     return runner
+
+
+def make_flash_attn_stage_runner(q: torch.Tensor, kv_len: int) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    return make_flash_attn_runner(q, kv_len, load_stock_flash_attn_with_kvcache())
 
 
 def make_flash_attn_zipserv_runner(
     q: torch.Tensor,
     kv_len: int,
     kv_heads: int,
-    comp_k: ZipservCompressed,
-    comp_v: ZipservCompressed,
+    comp_pair: Tuple[ZipservCompressed, ZipservCompressed],
+    layout: str = "by_kv_head",
     force_regular: bool = True,
 ) -> Callable[[], torch.Tensor]:
-    flash_attn_with_kvcache = load_flash_attn_with_kvcache(
-        use_integrated_zipserv=True,
-        integrated_regular_only=force_regular,
+    return make_flash_attn_runner(
+        q,
+        kv_len,
+        load_integrated_flash_attn_with_kvcache(regular_only=force_regular),
+        force_regular=force_regular,
+        kv_heads=kv_heads,
+        comp_pair=comp_pair,
+        layout=layout,
     )
-    batch_size, num_q_heads, head_dim = q.shape
-    q_4d = q.view(batch_size, 1, num_q_heads, head_dim).contiguous()
-    cache_seqlens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=q.device)
-    k_cache = torch.empty((batch_size, 1, kv_heads, head_dim), dtype=q.dtype, device=q.device)
-    v_cache = torch.empty_like(k_cache)
-    zipserv_k = zipserv_descriptor(comp_k)
-    zipserv_v = zipserv_descriptor(comp_v)
-
-    def runner() -> torch.Tensor:
-        out_4d = flash_attn_with_kvcache(
-            q_4d,
-            k_cache,
-            v_cache,
-            cache_seqlens=cache_seqlens,
-            zipserv_k=zipserv_k,
-            zipserv_v=zipserv_v,
-            zipserv_num_heads_k=kv_heads,
-            num_splits=1 if force_regular else 0,
-        )
-        return out_4d.squeeze(1)
-
-    return runner
 
 
 def time_cuda(fn, warmup: int, iters: int, nvtx_label: str | None = None):
@@ -723,112 +695,259 @@ def time_cuda(fn, warmup: int, iters: int, nvtx_label: str | None = None):
     return out, start.elapsed_time(stop) / iters
 
 
-def benchmark_one(
-    ext: object,
+BACKEND_SPECS = (
+    {
+        "trigger_modes": {FLASH_ATTN_MODE, STAGED_FLASH_ATTN_MODE},
+        "baseline_mode": FLASH_ATTN_MODE,
+        "staged_mode": STAGED_FLASH_ATTN_MODE,
+        "runner_kind": FLASH_ATTN_MODE,
+        "compressed_key": "dense",
+        "compressed_error": "staged_flashattn requires dense compressed K/V artifacts",
+    },
+    {
+        "trigger_modes": {FLASHINFER_MODE, STAGED_FLASHINFER_MODE},
+        "baseline_mode": FLASHINFER_MODE,
+        "staged_mode": STAGED_FLASHINFER_MODE,
+        "runner_kind": FLASHINFER_MODE,
+        "compressed_key": "paged",
+        "compressed_error": "flashinfer modes require paged K/V cache and compressed artifacts",
+        "cache_key": "paged",
+        "cache_error": "flashinfer modes require paged K/V cache and compressed artifacts",
+        "page_block_size": FLASHINFER_PAGE_BLOCK_SIZE,
+    },
+)
+
+
+def require_artifact_pair(
+    artifacts: Dict[str, Dict[str, object]],
+    kind: str,
+    key: str,
+    error: str,
+) -> Tuple[object, object]:
+    pair = artifacts[kind].get(key)
+    if pair is None:
+        raise RuntimeError(error)
+    return pair
+
+
+def benchmark_case(
     mode: str,
-    dense_k: torch.Tensor,
-    dense_v: torch.Tensor,
-    comp_k: ZipservCompressed,
-    comp_v: ZipservCompressed,
+    batch_size: int,
+    args: argparse.Namespace,
+    context: BenchmarkContext,
+    fn: Callable[[], torch.Tensor],
+) -> Dict[str, float | str]:
+    _, latency_ms = time_cuda(
+        fn,
+        args.warmup,
+        args.iters,
+        nvtx_label=(
+            f"{mode}|b{batch_size}|kv{args.kv_len}|qh{context.num_q_heads}|"
+            f"kvh{context.num_kv_heads}|d{context.head_dim}"
+        ),
+    )
+    return {"latency_ms": float(latency_ms), "status": "ok"}
+
+
+def make_staged_run_fn(
+    layout: str,
+    ext: object,
+    runner: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    comp_pair: Tuple[ZipservCompressed, ZipservCompressed],
+    batch_size: int,
     kv_len: int,
-    num_q_heads: int,
     kv_heads: int,
     head_dim: int,
-    warmup: int,
-    iters: int,
-    runner: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-    zipserv_runner: Callable[[], torch.Tensor] | None = None,
-    reuse_k_workspace: torch.Tensor | None = None,
-    reuse_v_workspace: torch.Tensor | None = None,
-    flash_attn_ext: object | None = None,
+    device: torch.device,
     page_block_size: int | None = None,
-    cache_batch_size: int | None = None,
-) -> Tuple[torch.Tensor, Dict[str, float | str | int]]:
-    out = None
-    batch_size = int(dense_k.shape[0])
-    nvtx_label = f"{mode}|b{batch_size}|kv{kv_len}|qh{num_q_heads}|kvh{kv_heads}|d{head_dim}"
+) -> Callable[[], torch.Tensor]:
+    workspaces = tuple(
+        torch.empty((comp.rows, comp.cols), dtype=torch.bfloat16, device=device)
+        for comp in comp_pair
+    )
 
-    if mode == "direct":
-        if runner is None:
-            raise ValueError("direct mode requires a prepared attention runner")
-        out, latency_ms = time_cuda(lambda: runner(dense_k, dense_v), warmup, iters, nvtx_label=nvtx_label)
-    elif mode == "staged_dense":
-        if runner is None:
-            raise ValueError("staged_dense mode requires a prepared attention runner")
-        if reuse_k_workspace is None or reuse_v_workspace is None:
-            raise ValueError("staged_dense mode requires reusable K/V output buffers")
-        batch_size_cache = cache_batch_size if cache_batch_size is not None else int(dense_k.shape[0])
-
-        def staged_dense():
-            k = decompress_to_batched_kv(
-                ext,
-                comp_k,
-                batch_size_cache,
-                kv_len,
-                kv_heads,
-                head_dim,
-                workspace=reuse_k_workspace,
-            )
-            v = decompress_to_batched_kv(
-                ext,
-                comp_v,
-                batch_size_cache,
-                kv_len,
-                kv_heads,
-                head_dim,
-                workspace=reuse_v_workspace,
-            )
+    def run() -> torch.Tensor:
+        if layout == "dense":
+            k = decompress_to_batched_kv(ext, comp_pair[0], batch_size, kv_len, kv_heads, head_dim, workspace=workspaces[0])
+            v = decompress_to_batched_kv(ext, comp_pair[1], batch_size, kv_len, kv_heads, head_dim, workspace=workspaces[1])
             return runner(k, v)
-
-        out, latency_ms = time_cuda(staged_dense, warmup, iters, nvtx_label=nvtx_label)
-    elif mode == "staged_paged":
-        if runner is None:
-            raise ValueError("staged_paged mode requires a prepared attention runner")
-        if reuse_k_workspace is None or reuse_v_workspace is None:
-            raise ValueError("staged_paged mode requires reusable dense K/V workspaces")
         if page_block_size is None:
-            raise ValueError("staged_paged mode requires page_block_size")
-        batch_size_cache = cache_batch_size if cache_batch_size is not None else 0
-        if batch_size_cache <= 0:
-            raise ValueError("staged_paged mode could not infer batch_size_cache")
+            raise ValueError("paged staged mode requires page_block_size")
+        k = decompress_to_batched_paged_kv(
+            ext,
+            comp_pair[0],
+            batch_size,
+            kv_heads,
+            head_dim,
+            page_block_size,
+            workspace=workspaces[0],
+        )
+        v = decompress_to_batched_paged_kv(
+            ext,
+            comp_pair[1],
+            batch_size,
+            kv_heads,
+            head_dim,
+            page_block_size,
+            workspace=workspaces[1],
+        )
+        return runner(k, v)
 
-        def staged_paged():
-            k = decompress_to_batched_paged_kv(
-                ext,
-                comp_k,
-                batch_size_cache,
-                kv_heads,
-                head_dim,
-                page_block_size,
-                workspace=reuse_k_workspace,
-            )
-            v = decompress_to_batched_paged_kv(
-                ext,
-                comp_v,
-                batch_size_cache,
-                kv_heads,
-                head_dim,
-                page_block_size,
-                workspace=reuse_v_workspace,
-            )
-            return runner(k, v)
-
-        out, latency_ms = time_cuda(staged_paged, warmup, iters, nvtx_label=nvtx_label)
-    elif mode == FUSED_FLASH_ATTN_MODE:
-        if zipserv_runner is None:
-            raise ValueError(f"{mode} requires a prepared ZipServ fused runner")
-        out, latency_ms = time_cuda(zipserv_runner, warmup, iters, nvtx_label=nvtx_label)
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    metrics = {
-        "latency_ms": float(latency_ms),
-        "status": "ok",
-    }
-    return out, metrics
+    return run
 
 
-def main() -> None:
+def make_backend_runner(
+    spec: Dict[str, object],
+    context: BenchmarkContext,
+    args: argparse.Namespace,
+    batch_inputs: Dict[str, object],
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    q = batch_inputs["q"]
+    if spec["runner_kind"] == FLASH_ATTN_MODE:
+        return make_flash_attn_stage_runner(q, args.kv_len)
+    return make_flashinfer_runner(
+        q,
+        args.kv_len,
+        context.num_q_heads,
+        context.num_kv_heads,
+        context.head_dim,
+        spec["page_block_size"],
+    )
+
+
+def run_backend_family(
+    rows: List[Dict[str, float | str | int]],
+    header_state: Dict[str, bool],
+    args: argparse.Namespace,
+    mode_set: set[str],
+    context: BenchmarkContext,
+    batch_inputs: Dict[str, object],
+    artifacts: Dict[str, Dict[str, object]],
+    spec: Dict[str, object],
+) -> None:
+    if not (mode_set & spec["trigger_modes"]):
+        return
+
+    q = batch_inputs["q"]
+    batch_size = int(q.shape[0])
+    runner = make_backend_runner(spec, context, args, batch_inputs)
+    baseline_pair = (
+        batch_inputs["dense"]
+        if spec["runner_kind"] == FLASH_ATTN_MODE
+        else require_artifact_pair(artifacts, "cache", spec["cache_key"], spec["cache_error"])
+    )
+    baseline_metrics = benchmark_case(
+        spec["baseline_mode"],
+        batch_size,
+        args,
+        context,
+        lambda: runner(*baseline_pair),
+    )
+    baseline_latency_ms = float(baseline_metrics["latency_ms"])
+
+    if spec["baseline_mode"] in mode_set:
+        append_result_row(rows, header_state, args, context, spec["baseline_mode"], batch_size, baseline_metrics, None)
+
+    if spec["staged_mode"] in mode_set:
+        comp_pair = require_artifact_pair(
+            artifacts,
+            "compressed",
+            spec["compressed_key"],
+            spec["compressed_error"],
+        )
+        staged_metrics = benchmark_case(
+            spec["staged_mode"],
+            batch_size,
+            args,
+            context,
+            make_staged_run_fn(
+                spec["compressed_key"],
+                context.ext,
+                runner,
+                comp_pair,
+                batch_size,
+                args.kv_len,
+                context.num_kv_heads,
+                context.head_dim,
+                q.device,
+                page_block_size=spec.get("page_block_size"),
+            ),
+        )
+        append_result_row(
+            rows,
+            header_state,
+            args,
+            context,
+            spec["staged_mode"],
+            batch_size,
+            staged_metrics,
+            baseline_latency_ms,
+        )
+
+
+def run_fused_flash_attn(
+    rows: List[Dict[str, float | str | int]],
+    header_state: Dict[str, bool],
+    args: argparse.Namespace,
+    mode_set: set[str],
+    context: BenchmarkContext,
+    batch_inputs: Dict[str, object],
+    artifacts: Dict[str, Dict[str, object]],
+) -> None:
+    if FUSED_FLASH_ATTN_MODE not in mode_set:
+        return
+    q = batch_inputs["q"]
+    batch_size = int(q.shape[0])
+    flash_attn_with_kvcache = load_integrated_flash_attn_with_kvcache(
+        regular_only=context.fused_regular_only
+    )
+    baseline_runner = make_flash_attn_runner(
+        q,
+        args.kv_len,
+        flash_attn_with_kvcache,
+        force_regular=context.fused_regular_only,
+    )
+    baseline_metrics = benchmark_case(
+        FLASH_ATTN_MODE,
+        batch_size,
+        args,
+        context,
+        lambda: baseline_runner(*batch_inputs["dense"]),
+    )
+    comp_pair = require_artifact_pair(
+        artifacts,
+        "compressed",
+        context.fused_layout,
+        "fused_flashattn requires fused compressed K/V artifacts",
+    )
+    fused_metrics = benchmark_case(
+        FUSED_FLASH_ATTN_MODE,
+        batch_size,
+        args,
+        context,
+        make_flash_attn_runner(
+            q,
+            args.kv_len,
+            flash_attn_with_kvcache,
+            force_regular=context.fused_regular_only,
+            kv_heads=context.num_kv_heads,
+            comp_pair=comp_pair,
+            layout=context.fused_layout,
+        ),
+    )
+    append_result_row(
+        rows,
+        header_state,
+        args,
+        context,
+        FUSED_FLASH_ATTN_MODE,
+        batch_size,
+        fused_metrics,
+        float(baseline_metrics["latency_ms"]),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ZipServ decode-attention benchmark")
     parser.add_argument("--model_root", type=Path, default=DEFAULT_MODEL_ROOT)
     parser.add_argument("--kv_dir", type=Path, default=DEFAULT_KV_DIR)
@@ -851,15 +970,191 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--out_csv", type=Path, default=DEFAULT_OUT_CSV)
     parser.add_argument(
-        "--fused_force_regular",
-        action="store_true",
-        help="Deprecated: fused_flashattn now defaults to FlashAttention's regular non-split path",
+        "--fused_layout",
+        type=str,
+        choices=FUSED_LAYOUT_CHOICES,
+        default="by_kv_head",
+        help="Compressed ZipServ layout used by fused_flashattn",
     )
     parser.add_argument(
         "--fused_splitkv",
         action="store_true",
         help="Opt back into the legacy split-kv fused FlashAttention path for comparison",
     )
+    return parser
+
+
+def validate_modes(modes: Sequence[str]) -> None:
+    for mode in modes:
+        if mode not in SUPPORTED_MODES:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+
+def load_benchmark_context(args: argparse.Namespace, modes: Sequence[str], device: torch.device) -> BenchmarkContext:
+    mode_set = set(modes)
+    ext = load_zipserv_extension()
+    config = load_model_config(args.model_root)
+    q_entry = load_manifest_entry(args.model_root, args.layer)
+    q_weight = load_bf16_bin(Path(q_entry["path"]), q_entry["shape"])
+    hidden_size = int(config["hidden_size"])
+    num_q_heads = int(config["num_attention_heads"])
+    num_kv_heads = int(config["num_key_value_heads"])
+    head_dim = hidden_size // num_q_heads
+    if FUSED_FLASH_ATTN_MODE in mode_set and num_kv_heads != 8:
+        raise ValueError(f"{FUSED_FLASH_ATTN_MODE} currently requires num_kv_heads == 8, got {num_kv_heads}")
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+
+    kv_pairs = load_kv_pairs(args.kv_dir)
+    max_tokens = min(pair.k.shape[0] for pair in kv_pairs)
+    if args.kv_len <= 0:
+        raise ValueError(f"kv_len must be positive, got {args.kv_len}")
+    if args.kv_len > max_tokens:
+        raise ValueError(f"Requested kv_len {args.kv_len} exceeds available length {max_tokens}")
+
+    return BenchmarkContext(
+        ext=ext,
+        device=device,
+        q_weight=q_weight,
+        hidden_size=hidden_size,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        kv_pairs=kv_pairs,
+        kv_pair_offset=args.layer % len(kv_pairs),
+        fused_regular_only=not args.fused_splitkv,
+        fused_layout=args.fused_layout,
+    )
+
+
+def prepare_batch_inputs(
+    context: BenchmarkContext,
+    batch_size: int,
+    kv_len: int,
+    seed: int,
+) -> Dict[str, object]:
+    batch_kv_pairs = select_kv_pairs(context.kv_pairs, batch_size, start_pair_idx=context.kv_pair_offset)
+    dense_k, dense_v = build_batched_dense_kv(batch_kv_pairs, kv_len, context.device)
+    q = build_q(
+        context.q_weight,
+        context.hidden_size,
+        context.num_q_heads,
+        context.head_dim,
+        seed,
+        context.device,
+        batch_size,
+    )
+    return {"q": q, "dense": (dense_k, dense_v)}
+
+
+def compress_kv_pair_with_layout(
+    ext: object,
+    kv_pair: Tuple[torch.Tensor, torch.Tensor],
+    head_dim: int,
+    pad_fn: Callable[..., Tuple[torch.Tensor, int, int]],
+    *pad_args: int,
+) -> Tuple[ZipservCompressed, ZipservCompressed]:
+    padded_k, logical_rows, _ = pad_fn(kv_pair[0], *pad_args)
+    padded_v, _, _ = pad_fn(kv_pair[1], *pad_args)
+    return (
+        make_zipserv_compressed(ext, padded_k, logical_rows, head_dim),
+        make_zipserv_compressed(ext, padded_v, logical_rows, head_dim),
+    )
+
+
+def build_kv_cache_pair_with_layout(
+    kv_pair: Tuple[torch.Tensor, torch.Tensor],
+    cache_builder: Callable[..., Tuple[torch.Tensor, int]],
+    *cache_args: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    k_cache, _ = cache_builder(kv_pair[0], *cache_args)
+    v_cache, _ = cache_builder(kv_pair[1], *cache_args)
+    return k_cache, v_cache
+
+
+ARTIFACT_LAYOUT_SPECS = {
+    "dense": {
+        "pad": pad_batched_kv_prefix,
+        "pad_args": (),
+    },
+    "paged": {
+        "pad": pad_batched_kv_prefix_paged,
+        "pad_args": (FLASHINFER_PAGE_BLOCK_SIZE,),
+        "cache": make_batched_paged_kv_cache,
+        "cache_args": (FLASHINFER_PAGE_BLOCK_SIZE,),
+    },
+    "by_kv_head": {
+        "pad": pad_batched_kv_prefix_by_kv_head,
+        "pad_args": (),
+    },
+}
+
+
+def prepare_batch_artifacts(
+    context: BenchmarkContext,
+    modes: Sequence[str],
+    batch_inputs: Dict[str, object],
+) -> Dict[str, Dict[str, object]]:
+    mode_set = set(modes)
+    dense_pair = batch_inputs["dense"]
+    artifacts = {"compressed": {}, "cache": {}}
+    required_layouts = set()
+    if mode_set & {FLASH_ATTN_MODE, STAGED_FLASH_ATTN_MODE}:
+        required_layouts.add("dense")
+    if mode_set & {FLASHINFER_MODE, STAGED_FLASHINFER_MODE}:
+        required_layouts.add("paged")
+    if FUSED_FLASH_ATTN_MODE in mode_set:
+        required_layouts.add(context.fused_layout)
+    for layout in required_layouts:
+        spec = ARTIFACT_LAYOUT_SPECS[layout]
+        if layout in artifacts["compressed"]:
+            continue
+        artifacts["compressed"][layout] = compress_kv_pair_with_layout(
+            context.ext,
+            dense_pair,
+            context.head_dim,
+            spec["pad"],
+            *spec["pad_args"],
+        )
+        cache_builder = spec.get("cache")
+        if cache_builder is not None:
+            artifacts["cache"][layout] = build_kv_cache_pair_with_layout(
+                dense_pair,
+                cache_builder,
+                *spec["cache_args"],
+            )
+    return artifacts
+
+
+def append_result_row(
+    rows: List[Dict[str, float | str | int]],
+    header_state: Dict[str, bool],
+    args: argparse.Namespace,
+    context: BenchmarkContext,
+    mode: str,
+    batch_size: int,
+    metrics: Dict[str, float | str | int],
+    baseline_latency_ms: float | None,
+) -> None:
+    row = {
+        "layer": args.layer,
+        "mode": mode,
+        "batch_size": batch_size,
+        "kv_len": args.kv_len,
+        "q_heads": context.num_q_heads,
+        "kv_heads": context.num_kv_heads,
+        "head_dim": context.head_dim,
+        "base_path": baseline_ratio(float(metrics["latency_ms"]), baseline_latency_ms),
+        **metrics,
+    }
+    if baseline_latency_ms is None:
+        row["base_path"] = 1.0
+    rows.append(row)
+    print_terminal_row(row, header_state)
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -869,270 +1164,20 @@ def main() -> None:
     device = torch.device(f"cuda:{args.device}")
 
     modes = normalize_modes(args.modes)
+    mode_set = set(modes)
     batch_sizes = parse_csv_ints(args.batch_sizes)
-    supported_modes = {
-        FLASH_ATTN_MODE,
-        FLASHINFER_MODE,
-        STAGED_FLASH_ATTN_MODE,
-        STAGED_FLASHINFER_MODE,
-        FUSED_FLASH_ATTN_MODE,
-    }
-    for mode in modes:
-        if mode not in supported_modes:
-            raise ValueError(f"Unsupported mode: {mode}")
+    validate_modes(modes)
     availability_or_raise(modes)
-
-    ext = load_zipserv_extension()
-    config = load_model_config(args.model_root)
-    q_entry = load_manifest_entry(args.model_root, args.layer)
-    q_weight = load_bf16_bin(Path(q_entry["path"]), q_entry["shape"])
-    hidden_size = int(config["hidden_size"])
-    num_q_heads = int(config["num_attention_heads"])
-    num_kv_heads = int(config["num_key_value_heads"])
-    head_dim = hidden_size // num_q_heads
-    if ({FUSED_FLASH_ATTN_MODE} & set(modes)) and num_kv_heads != 8:
-        raise ValueError(f"{FUSED_FLASH_ATTN_MODE} currently requires num_kv_heads == 8, got {num_kv_heads}")
-    if num_q_heads % num_kv_heads != 0:
-        raise ValueError("num_q_heads must be divisible by num_kv_heads")
-    kv_pairs = load_kv_pairs(args.kv_dir)
-    max_tokens = min(pair.k.shape[0] for pair in kv_pairs)
-    if args.kv_len <= 0:
-        raise ValueError(f"kv_len must be positive, got {args.kv_len}")
-    if args.kv_len > max_tokens:
-        raise ValueError(f"Requested kv_len {args.kv_len} exceeds available length {max_tokens}")
-    kv_pair_offset = args.layer % len(kv_pairs)
+    context = load_benchmark_context(args, modes, device)
 
     rows = []
     header_state = {"printed": False}
-    use_integrated_flashattn_family = bool({FUSED_FLASH_ATTN_MODE} & set(modes))
-    # Default fused experiments to the regular decode kernel. The split-kv ZipServ path remains
-    # opt-in for comparison, but it is no longer the benchmark default or the default build.
-    use_fused_regular = not args.fused_splitkv or args.fused_force_regular
     for batch_size in batch_sizes:
-        batch_kv_pairs = select_kv_pairs(kv_pairs, batch_size, start_pair_idx=kv_pair_offset)
-        dense_k, dense_v = build_batched_dense_kv(batch_kv_pairs, args.kv_len, device)
-        q = build_q(q_weight, hidden_size, num_q_heads, head_dim, args.seed, device, batch_size)
-
-        dense_comp_k = None
-        dense_comp_v = None
-        if {FLASH_ATTN_MODE, STAGED_FLASH_ATTN_MODE} & set(modes):
-            padded_k, logical_rows, _ = pad_batched_kv_prefix(dense_k)
-            padded_v, _, _ = pad_batched_kv_prefix(dense_v)
-            dense_comp_k = make_zipserv_compressed(ext, padded_k, logical_rows, head_dim)
-            dense_comp_v = make_zipserv_compressed(ext, padded_v, logical_rows, head_dim)
-
-        flashinfer_k_cache = None
-        flashinfer_v_cache = None
-        flashinfer_comp_k = None
-        flashinfer_comp_v = None
-        if {FLASHINFER_MODE, STAGED_FLASHINFER_MODE} & set(modes):
-            flashinfer_k_cache, _ = make_batched_paged_kv_cache(dense_k, FLASHINFER_PAGE_BLOCK_SIZE)
-            flashinfer_v_cache, _ = make_batched_paged_kv_cache(dense_v, FLASHINFER_PAGE_BLOCK_SIZE)
-            padded_k_flashinfer, flashinfer_logical_rows, _ = pad_batched_kv_prefix_paged(dense_k, FLASHINFER_PAGE_BLOCK_SIZE)
-            padded_v_flashinfer, _, _ = pad_batched_kv_prefix_paged(dense_v, FLASHINFER_PAGE_BLOCK_SIZE)
-            flashinfer_comp_k = make_zipserv_compressed(ext, padded_k_flashinfer, flashinfer_logical_rows, head_dim)
-            flashinfer_comp_v = make_zipserv_compressed(ext, padded_v_flashinfer, flashinfer_logical_rows, head_dim)
-
-        fused_comp_k = None
-        fused_comp_v = None
-        if FUSED_FLASH_ATTN_MODE in modes:
-            padded_k_fused, fused_logical_rows, _ = pad_batched_kv_prefix_by_kv_head(dense_k)
-            padded_v_fused, _, _ = pad_batched_kv_prefix_by_kv_head(dense_v)
-            fused_comp_k = make_zipserv_compressed(ext, padded_k_fused, fused_logical_rows, head_dim)
-            fused_comp_v = make_zipserv_compressed(ext, padded_v_fused, fused_logical_rows, head_dim)
-
-        flashattn_baseline_ms = None
-        flashattn_runner = None
-        flashattn_modes_requested = bool({FLASH_ATTN_MODE, STAGED_FLASH_ATTN_MODE, FUSED_FLASH_ATTN_MODE} & set(modes))
-        if flashattn_modes_requested:
-            flashattn_runner = make_flash_attn_stage_runner(
-                q,
-                args.kv_len,
-                use_integrated_extension=use_integrated_flashattn_family,
-                force_regular=use_integrated_flashattn_family and use_fused_regular,
-            )
-            _, metrics = benchmark_one(
-                ext,
-                "direct",
-                dense_k,
-                dense_v,
-                dense_comp_k,
-                dense_comp_v,
-                args.kv_len,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                args.warmup,
-                args.iters,
-                runner=flashattn_runner,
-            )
-            flashattn_baseline_ms = float(metrics["latency_ms"])
-            if FLASH_ATTN_MODE in modes:
-                rows.append({
-                    "layer": args.layer,
-                    "mode": FLASH_ATTN_MODE,
-                    "batch_size": batch_size,
-                    "kv_len": args.kv_len,
-                    "q_heads": num_q_heads,
-                    "kv_heads": num_kv_heads,
-                    "head_dim": head_dim,
-                    "base_path": 1.0,
-                    **metrics,
-                })
-                print_terminal_row(rows[-1], header_state)
-            if STAGED_FLASH_ATTN_MODE in modes:
-                if flashattn_runner is None:
-                    raise RuntimeError("staged_flashattn requires flash_attn_with_kvcache to be available")
-                flashattn_k_workspace = torch.empty((dense_comp_k.rows, dense_comp_k.cols), dtype=torch.bfloat16, device=q.device)
-                flashattn_v_workspace = torch.empty((dense_comp_v.rows, dense_comp_v.cols), dtype=torch.bfloat16, device=q.device)
-                _, staged_metrics = benchmark_one(
-                    ext,
-                    "staged_dense",
-                    dense_k,
-                    dense_v,
-                    dense_comp_k,
-                    dense_comp_v,
-                    args.kv_len,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    args.warmup,
-                    args.iters,
-                    runner=flashattn_runner,
-                    reuse_k_workspace=flashattn_k_workspace,
-                    reuse_v_workspace=flashattn_v_workspace,
-                    cache_batch_size=batch_size,
-                )
-                rows.append({
-                    "layer": args.layer,
-                    "mode": STAGED_FLASH_ATTN_MODE,
-                    "batch_size": batch_size,
-                    "kv_len": args.kv_len,
-                    "q_heads": num_q_heads,
-                    "kv_heads": num_kv_heads,
-                    "head_dim": head_dim,
-                    "base_path": baseline_ratio(float(staged_metrics["latency_ms"]), flashattn_baseline_ms),
-                    **staged_metrics,
-                })
-                print_terminal_row(rows[-1], header_state)
-            if FUSED_FLASH_ATTN_MODE in modes:
-                if flashattn_runner is None:
-                    raise RuntimeError("fused_flashattn requires flash_attn_with_kvcache to be available")
-                zipserv_runner = make_flash_attn_zipserv_runner(
-                    q,
-                    args.kv_len,
-                    num_kv_heads,
-                    fused_comp_k,
-                    fused_comp_v,
-                    force_regular=use_fused_regular,
-                )
-                _, fused_metrics = benchmark_one(
-                    ext,
-                    FUSED_FLASH_ATTN_MODE,
-                    dense_k,
-                    dense_v,
-                    fused_comp_k,
-                    fused_comp_v,
-                    args.kv_len,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    args.warmup,
-                    args.iters,
-                    zipserv_runner=zipserv_runner,
-                )
-                rows.append({
-                    "layer": args.layer,
-                    "mode": FUSED_FLASH_ATTN_MODE,
-                    "batch_size": batch_size,
-                    "kv_len": args.kv_len,
-                    "q_heads": num_q_heads,
-                    "kv_heads": num_kv_heads,
-                    "head_dim": head_dim,
-                    "base_path": baseline_ratio(float(fused_metrics["latency_ms"]), flashattn_baseline_ms),
-                    **fused_metrics,
-                })
-                print_terminal_row(rows[-1], header_state)
-        if {FLASHINFER_MODE, STAGED_FLASHINFER_MODE} & set(modes):
-            flashinfer_runner = make_flashinfer_runner(
-                q,
-                args.kv_len,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                FLASHINFER_PAGE_BLOCK_SIZE,
-            )
-            _, flashinfer_metrics = benchmark_one(
-                ext,
-                "direct",
-                flashinfer_k_cache,
-                flashinfer_v_cache,
-                flashinfer_comp_k,
-                flashinfer_comp_v,
-                args.kv_len,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                args.warmup,
-                args.iters,
-                runner=flashinfer_runner,
-            )
-            flashinfer_baseline_ms = float(flashinfer_metrics["latency_ms"])
-            if FLASHINFER_MODE in modes:
-                rows.append({
-                    "layer": args.layer,
-                    "mode": FLASHINFER_MODE,
-                    "batch_size": batch_size,
-                    "kv_len": args.kv_len,
-                    "q_heads": num_q_heads,
-                    "kv_heads": num_kv_heads,
-                    "head_dim": head_dim,
-                    "base_path": 1.0,
-                    **flashinfer_metrics,
-                })
-                print_terminal_row(rows[-1], header_state)
-            if STAGED_FLASHINFER_MODE in modes:
-                flashinfer_k_workspace = torch.empty(
-                    (flashinfer_comp_k.rows, flashinfer_comp_k.cols),
-                    dtype=torch.bfloat16,
-                    device=q.device,
-                )
-                flashinfer_v_workspace = torch.empty(
-                    (flashinfer_comp_v.rows, flashinfer_comp_v.cols),
-                    dtype=torch.bfloat16,
-                    device=q.device,
-                )
-                _, staged_metrics = benchmark_one(
-                    ext,
-                    "staged_paged",
-                    flashinfer_k_cache,
-                    flashinfer_v_cache,
-                    flashinfer_comp_k,
-                    flashinfer_comp_v,
-                    args.kv_len,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    args.warmup,
-                    args.iters,
-                    runner=flashinfer_runner,
-                    reuse_k_workspace=flashinfer_k_workspace,
-                    reuse_v_workspace=flashinfer_v_workspace,
-                    page_block_size=FLASHINFER_PAGE_BLOCK_SIZE,
-                    cache_batch_size=batch_size,
-                )
-                rows.append({
-                    "layer": args.layer,
-                    "mode": STAGED_FLASHINFER_MODE,
-                    "batch_size": batch_size,
-                    "kv_len": args.kv_len,
-                    "q_heads": num_q_heads,
-                    "kv_heads": num_kv_heads,
-                    "head_dim": head_dim,
-                    "base_path": baseline_ratio(float(staged_metrics["latency_ms"]), flashinfer_baseline_ms),
-                    **staged_metrics,
-                })
-                print_terminal_row(rows[-1], header_state)
+        batch_inputs = prepare_batch_inputs(context, batch_size, args.kv_len, args.seed)
+        artifacts = prepare_batch_artifacts(context, modes, batch_inputs)
+        for spec in BACKEND_SPECS:
+            run_backend_family(rows, header_state, args, mode_set, context, batch_inputs, artifacts, spec)
+        run_fused_flash_attn(rows, header_state, args, mode_set, context, batch_inputs, artifacts)
 
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -1154,8 +1199,9 @@ def main() -> None:
 
     print(f"Wrote {len(rows)} rows to {args.out_csv}")
     print(
-        f"layer={args.layer} kv_len={args.kv_len} kv_pair_pool={len(kv_pairs)} "
-        f"start_pair=({kv_pairs[kv_pair_offset].k_name}, {kv_pairs[kv_pair_offset].v_name})"
+        f"layer={args.layer} kv_len={args.kv_len} kv_pair_pool={len(context.kv_pairs)} "
+        f"start_pair=({context.kv_pairs[context.kv_pair_offset].k_name}, "
+        f"{context.kv_pairs[context.kv_pair_offset].v_name})"
     )
 
 

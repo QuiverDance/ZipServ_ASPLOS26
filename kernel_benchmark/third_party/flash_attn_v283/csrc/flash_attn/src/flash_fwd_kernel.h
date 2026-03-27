@@ -79,6 +79,9 @@ struct ZipservBlockLoadState {
     int rows_to_load;
     int block_rows;
     int global_tile_m_base;
+    int rows_per_global_tile;
+    int head_in_tile;
+    int num_heads_k;
     bool valid;
     ZipservGlobalTileInfo first_tile_info;
 };
@@ -318,6 +321,114 @@ __forceinline__ __device__ void zipserv_decompress_scratch_to_dst(
     }
 }
 
+template <typename Element, bool FullTile, typename TensorDst>
+__forceinline__ __device__ void zipserv_decompress_scratch_to_dst_token_major(
+    const ZipservCompressedKVParams &comp,
+    const ZipservGlobalTileInfo &tile_info,
+    const ZipservScratchBufferView &scratch,
+    TensorDst &dst,
+    const int row_base,
+    const int col_base,
+    const int valid_rows,
+    const int valid_cols,
+    const int num_heads_k,
+    const int head_in_tile) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int *median_offset_ptr = comp.tile_offsets_median + (tile_info.global_tile_idx * kZipservWarpsPerTile + warp_id) * 2;
+    int warp_hf_start = median_offset_ptr[0];
+    int warp_full_start = median_offset_ptr[1];
+    uint64_t *smem_bitmap1_warp = scratch.bitmap1 + warp_id * 2 * 8;
+    uint64_t *smem_bitmap2_warp = scratch.bitmap2 + warp_id * 2 * 8;
+    uint64_t *smem_bitmap3_warp = scratch.bitmap3 + warp_id * 2 * 8;
+    const int pos1 = lane_id << 1;
+    const int pos2 = pos1 + 1;
+    const int local_m = pos1 / 8;
+    const int local_k = pos1 % 8;
+
+    #pragma unroll
+    for (int col_group = 0; col_group < 8; ++col_group) {
+        #pragma unroll
+        for (int row_group = 0; row_group < 2; ++row_group) {
+            const int small_tile_idx = col_group * 2 + row_group;
+            const uint64_t bitmap1 = smem_bitmap1_warp[small_tile_idx];
+            const uint64_t bitmap2 = smem_bitmap2_warp[small_tile_idx];
+            const uint64_t bitmap3 = smem_bitmap3_warp[small_tile_idx];
+            const uint64_t high_freq_indicator = bitmap1 | bitmap2 | bitmap3;
+
+            const uint8_t code_pos1 =
+                ((bitmap3 >> pos1) & 1ULL) << 2 |
+                ((bitmap2 >> pos1) & 1ULL) << 1 |
+                ((bitmap1 >> pos1) & 1ULL);
+            const uint8_t code_pos2 =
+                ((bitmap3 >> pos2) & 1ULL) << 2 |
+                ((bitmap2 >> pos2) & 1ULL) << 1 |
+                ((bitmap1 >> pos2) & 1ULL);
+            const uint16_t exponent_bits_pos1 = (comp.start_exp + code_pos1) << 7;
+            const uint16_t exponent_bits_pos2 = (comp.start_exp + code_pos2) << 7;
+
+            const uint64_t mask_before_pos1 = (1ULL << pos1) - 1;
+            const int high_freq_before_pos1 = __popcll(high_freq_indicator & mask_before_pos1);
+            const int low_freq_before_pos1 = pos1 - high_freq_before_pos1;
+            const bool is_high_freq_pos1 = (high_freq_indicator & (1ULL << pos1)) != 0;
+
+            __nv_bfloat16 val1;
+            if (is_high_freq_pos1) {
+                const uint8_t combined = scratch.sign_mantissa[warp_hf_start + high_freq_before_pos1];
+                const uint8_t sign = (combined >> 7) & 0x1;
+                const uint8_t mantissa = combined & 0x7F;
+                const uint16_t bf16_bits = ((sign & 0x1) << 15) | exponent_bits_pos1 | (mantissa & 0x7F);
+                val1 = __ushort_as_bfloat16(bf16_bits);
+            } else {
+                val1 = scratch.full_values[warp_full_start + low_freq_before_pos1];
+            }
+
+            const int high_freq_before_pos2 = high_freq_before_pos1 + (is_high_freq_pos1 ? 1 : 0);
+            const int low_freq_before_pos2 = pos2 - high_freq_before_pos2;
+            const bool is_high_freq_pos2 = (high_freq_indicator & (1ULL << pos2)) != 0;
+
+            __nv_bfloat16 val2;
+            if (is_high_freq_pos2) {
+                const uint8_t combined = scratch.sign_mantissa[warp_hf_start + high_freq_before_pos2];
+                const uint8_t sign = (combined >> 7) & 0x1;
+                const uint8_t mantissa = combined & 0x7F;
+                const uint16_t bf16_bits = ((sign & 0x1) << 15) | exponent_bits_pos2 | (mantissa & 0x7F);
+                val2 = __ushort_as_bfloat16(bf16_bits);
+            } else {
+                val2 = scratch.full_values[warp_full_start + low_freq_before_pos2];
+            }
+
+            const int tile_row = warp_id * 16 + row_group * 8 + local_m;
+            const int tile_col = col_group * 8 + local_k;
+            if (tile_row % num_heads_k == head_in_tile) {
+                const int dst_local_row = tile_row / num_heads_k;
+                if constexpr (FullTile) {
+                    const int dst_row = row_base + dst_local_row;
+                    const int dst_col = col_base + tile_col;
+                    dst(dst_row, dst_col) = zipserv_convert_element<Element>(val1);
+                    dst(dst_row, dst_col + 1) = zipserv_convert_element<Element>(val2);
+                } else if (dst_local_row < valid_rows) {
+                    const int dst_row = row_base + dst_local_row;
+                    const int dst_col = col_base + tile_col;
+                    if (tile_col < valid_cols) {
+                        dst(dst_row, dst_col) = zipserv_convert_element<Element>(val1);
+                    }
+                    if (tile_col + 1 < valid_cols) {
+                        dst(dst_row, dst_col + 1) = zipserv_convert_element<Element>(val2);
+                    }
+                }
+            }
+
+            const int num_high_freq_lane_31 = __shfl_sync(
+                0xffffffff,
+                high_freq_before_pos2 + (is_high_freq_pos2 ? 1 : 0),
+                31);
+            warp_hf_start += num_high_freq_lane_31;
+            warp_full_start += 64 - num_high_freq_lane_31;
+        }
+    }
+}
+
 __forceinline__ __device__ ZipservBlockLoadState zipserv_begin_block_load(
     const ZipservCompressedKVParams &comp,
     const int batch_idx,
@@ -330,17 +441,27 @@ __forceinline__ __device__ ZipservBlockLoadState zipserv_begin_block_load(
     constexpr int kRowsPerTile = 64;
     constexpr int kColsPerTile = 64;
     const int total_rows_per_head = comp.head_stride_rows;
-    const int head_row_base = batch_idx * comp.batch_stride_rows + kv_head * total_rows_per_head + block_row;
     const int remaining_head_rows = max(0, total_rows_per_head - block_row);
     const int rows_to_load = max(0, min(block_rows, min(total_valid_rows, remaining_head_rows)));
-    const int max_row_tiles = cute::ceil_div(rows_to_load, kRowsPerTile);
+    const int num_heads_k = comp.batch_stride_rows / max(1, comp.head_stride_rows);
+    load_state.num_heads_k = num_heads_k;
+    load_state.head_in_tile = kv_head;
+    if (comp.layout == ZIPSERV_LAYOUT_TOKEN_MAJOR) {
+        load_state.rows_per_global_tile = kRowsPerTile / max(1, num_heads_k);
+        const int head_row_base = batch_idx * comp.batch_stride_rows + block_row * num_heads_k + kv_head;
+        load_state.global_tile_m_base = head_row_base / kRowsPerTile;
+    } else {
+        load_state.rows_per_global_tile = kRowsPerTile;
+        const int head_row_base = batch_idx * comp.batch_stride_rows + kv_head * total_rows_per_head + block_row;
+        load_state.global_tile_m_base = head_row_base / kRowsPerTile;
+    }
+    const int max_row_tiles = cute::ceil_div(rows_to_load, load_state.rows_per_global_tile);
     const int max_col_tiles = cute::ceil_div(comp.cols, kColsPerTile);
     const int total_tiles = max_row_tiles * max_col_tiles;
     load_state.total_tiles = total_tiles;
     load_state.max_col_tiles = max_col_tiles;
     load_state.rows_to_load = rows_to_load;
     load_state.block_rows = block_rows;
-    load_state.global_tile_m_base = head_row_base / kRowsPerTile;
     load_state.valid = total_tiles > 0;
     if (total_tiles == 0) {
         return load_state;
@@ -380,7 +501,7 @@ __forceinline__ __device__ void zipserv_finish_block_load(
     for (int tile_idx = 0; tile_idx < load_state.total_tiles; ++tile_idx) {
         const int row_tile = tile_idx / load_state.max_col_tiles;
         const int col_tile = tile_idx % load_state.max_col_tiles;
-        const int tile_row_base = row_tile * kRowsPerTile;
+        const int tile_row_base = row_tile * load_state.rows_per_global_tile;
         const bool has_next = tile_idx + 1 < load_state.total_tiles;
         ZipservGlobalTileInfo next_tile_info;
         auto next_scratch = zipserv_get_scratch_buffer(comp, zipserv_smem, (tile_idx + 1) & 1);
@@ -396,9 +517,35 @@ __forceinline__ __device__ void zipserv_finish_block_load(
                 next_tile_info);
         }
 
-        const int valid_rows = zipserv_valid_rows(load_state.rows_to_load, tile_row_base, kRowsPerTile);
+        const int valid_rows = zipserv_valid_rows(load_state.rows_to_load, tile_row_base, load_state.rows_per_global_tile);
         const int valid_cols = min(kColsPerTile, comp.cols - col_tile * kColsPerTile);
-        if (valid_rows == kRowsPerTile && valid_cols == kColsPerTile) {
+        if (comp.layout == ZIPSERV_LAYOUT_TOKEN_MAJOR) {
+            if (valid_rows == load_state.rows_per_global_tile && valid_cols == kColsPerTile) {
+                zipserv_decompress_scratch_to_dst_token_major<Element, /*FullTile=*/true>(
+                    comp,
+                    current_tile_info,
+                    current_scratch,
+                    dst_smem,
+                    tile_row_base,
+                    col_tile * kColsPerTile,
+                    valid_rows,
+                    valid_cols,
+                    load_state.num_heads_k,
+                    load_state.head_in_tile);
+            } else {
+                zipserv_decompress_scratch_to_dst_token_major<Element, /*FullTile=*/false>(
+                    comp,
+                    current_tile_info,
+                    current_scratch,
+                    dst_smem,
+                    tile_row_base,
+                    col_tile * kColsPerTile,
+                    valid_rows,
+                    valid_cols,
+                    load_state.num_heads_k,
+                    load_state.head_in_tile);
+            }
+        } else if (valid_rows == kRowsPerTile && valid_cols == kColsPerTile) {
             zipserv_decompress_scratch_to_dst<Element, /*FullTile=*/true>(
                 comp,
                 current_tile_info,
